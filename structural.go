@@ -12,7 +12,11 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
-const structuralTimeout = 5 * time.Minute
+const (
+	structuralTimeout    = 5 * time.Minute
+	structuralNumPredict = 8192
+	structuralNumCtx     = 65536
+)
 
 func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay int, verbose bool) error {
 	absRoot, err := filepath.Abs(projectRoot)
@@ -188,7 +192,7 @@ Return ONLY valid JSON:
 			Messages: messages,
 			Tools:    tools,
 			Format:   json.RawMessage(`"json"`),
-			Options:  map[string]any{"temperature": 0.3, "num_predict": 32768},
+			Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict, "num_ctx": structuralNumCtx},
 		}
 
 		resp, _, _, err := streamLLMChat(client, req, "structural")
@@ -228,7 +232,7 @@ Return ONLY valid JSON:
 					Model:    model,
 					Messages: messages,
 					Format:   json.RawMessage(`"json"`),
-					Options:  map[string]any{"temperature": 0.3, "num_predict": 32768},
+					Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict, "num_ctx": structuralNumCtx},
 				}
 				finalResp, _, _, err := streamLLMChat(client, finalReq, "final analysis")
 				if err != nil {

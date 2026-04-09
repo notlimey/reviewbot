@@ -13,7 +13,11 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
-const llmTimeout = 10 * time.Minute
+const (
+	llmTimeout     = 10 * time.Minute
+	scanNumPredict = 4096  // output limit per file — keeps responses concise
+	scanNumCtx     = 32768 // total context window — must fit prompt + output
+)
 
 func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool) error {
 	absRoot, err := filepath.Abs(projectRoot)
@@ -96,7 +100,7 @@ func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool) err
 		fmt.Printf("  … [%d/%d] %s (~%d tokens, %s)\n", scanned, totalPending, f.Path, f.TokenEstimate, f.Language)
 
 		start := time.Now()
-		resp, truncated, err := callLLMForScan(client, model, f.Path, f.Language, string(content), f.TokenEstimate)
+		resp, truncated, err := callLLMForScan(client, model, f.Path, f.Language, string(content))
 		elapsed := time.Since(start)
 
 		if err != nil {
@@ -199,9 +203,9 @@ func saveScanResults(db *sql.DB, fileID int64, parsed *ScanResponse) (int, error
 	return issueCount, nil
 }
 
-// callLLMForScan streams the response from the LLM, printing a live token counter.
-// Returns the response text, whether it was truncated by the token limit, and any error.
-func callLLMForScan(client *api.Client, model, path, language, content string, inputTokens int) (string, bool, error) {
+// callLLMForScan sends a file to the LLM for review and returns the raw
+// response, whether it was truncated, and any error.
+func callLLMForScan(client *api.Client, model, path, language, content string) (string, bool, error) {
 	prompt := fmt.Sprintf(`Review this %s file. Report ONLY real bugs, security issues, or performance problems. Skip style nits.
 
 IMPORTANT: Be extremely concise. Each field value should be 1-2 sentences max. Do NOT repeat code. Do NOT explain obvious things. The entire response must be compact JSON.
@@ -214,22 +218,17 @@ If no issues: {"issues":[],"metadata":{"exports":[],"imports":[],"interfaces":[]
 File: %s
 `+"```%s\n%s\n```", language, path, language, content)
 
-	// Scale token budget: base of 2048 + 3x input tokens, capped at 16384.
-	// A well-formed response should be much smaller than the input.
-	maxTokens := 2048 + inputTokens*3
-	if maxTokens > 16384 {
-		maxTokens = 16384
-	}
-
 	stream := true
 	req := &api.ChatRequest{
-		Model: model,
-		Messages: []api.Message{
-			{Role: "user", Content: prompt},
+		Model:    model,
+		Messages: []api.Message{{Role: "user", Content: prompt}},
+		Stream:   &stream,
+		Format:   json.RawMessage(`"json"`),
+		Options: map[string]any{
+			"temperature": 0.3,
+			"num_predict": scanNumPredict,
+			"num_ctx":     scanNumCtx,
 		},
-		Stream:  &stream,
-		Format:  json.RawMessage(`"json"`),
-		Options: map[string]any{"temperature": 0.3, "num_predict": maxTokens},
 	}
 
 	var response strings.Builder
@@ -240,14 +239,8 @@ File: %s
 		tokenCount := 0
 		truncated := false
 
-		cancelled := false
 		ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
 		lastErr = client.Chat(ctx, req, func(resp api.ChatResponse) error {
-			// Stop accumulating after we've cancelled — buffered
-			// callbacks may still arrive.
-			if cancelled {
-				return nil
-			}
 			if resp.Message.Content != "" {
 				response.WriteString(resp.Message.Content)
 				tokenCount++
@@ -258,19 +251,11 @@ File: %s
 			if resp.Done && resp.DoneReason == "length" {
 				truncated = true
 			}
-			// Hard cutoff — cancel the stream if we've exceeded our budget.
-			// Ollama's JSON mode can ignore num_predict to complete JSON.
-			if tokenCount >= maxTokens {
-				truncated = true
-				cancelled = true
-				cancel()
-			}
 			return nil
 		})
 		cancel()
 
-		// If we cancelled due to our hard cutoff, treat as success with truncation
-		if lastErr == nil || (truncated && response.Len() > 0) {
+		if lastErr == nil {
 			fmt.Printf("\r    … generated %d tokens            \n", tokenCount)
 			return response.String(), truncated, nil
 		}
@@ -282,9 +267,8 @@ File: %s
 }
 
 // streamLLMChat streams an LLM chat request with a live token counter.
-// Returns the accumulated text, the final ChatResponse (for tool calls), whether truncated, and any error.
-const streamHardLimit = 16384
-
+// Returns the final ChatResponse (for tool calls), the accumulated text,
+// whether it was truncated, and any error.
 func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.ChatResponse, string, bool, error) {
 	stream := true
 	req.Stream = &stream
@@ -294,12 +278,8 @@ func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.
 	truncated := false
 	var finalResp api.ChatResponse
 
-	cancelled := false
 	ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
 	err := client.Chat(ctx, req, func(r api.ChatResponse) error {
-		if cancelled {
-			return nil
-		}
 		finalResp = r
 		if r.Message.Content != "" {
 			response.WriteString(r.Message.Content)
@@ -311,11 +291,6 @@ func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.
 		if r.Done && r.DoneReason == "length" {
 			truncated = true
 		}
-		if tokenCount >= streamHardLimit {
-			truncated = true
-			cancelled = true
-			cancel()
-		}
 		return nil
 	})
 	cancel()
@@ -324,14 +299,7 @@ func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.
 		fmt.Printf("\r    … %s: %d tokens            \n", label, tokenCount)
 	}
 
-	// Put the accumulated content into the final response message
 	finalResp.Message.Content = response.String()
-
-	// If we cancelled due to our hard cutoff, ignore the context error
-	if truncated && response.Len() > 0 {
-		err = nil
-	}
-
 	return finalResp, response.String(), truncated, err
 }
 
