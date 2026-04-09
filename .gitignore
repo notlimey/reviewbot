@@ -1,0 +1,13 @@
+# Binary
+reviewbot
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# macOS
+.DS_Store
+
+# Generated reports
+review_report.md
