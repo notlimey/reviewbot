@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"strconv"
 )
 
 // FileRecord represents a row in the files table.
@@ -90,6 +91,70 @@ type ScanIssue struct {
 	LineStart   *int    `json:"line_start"`
 	LineEnd     *int    `json:"line_end"`
 	Suggestion  string  `json:"suggestion"`
+}
+
+// UnmarshalJSON handles LLMs returning numeric fields as strings
+// (e.g. "confidence": "0.9" instead of "confidence": 0.9).
+func (s *ScanIssue) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Category    string          `json:"category"`
+		Severity    string          `json:"severity"`
+		Confidence  json.RawMessage `json:"confidence"`
+		Title       string          `json:"title"`
+		Description string          `json:"description"`
+		LineStart   json.RawMessage `json:"line_start"`
+		LineEnd     json.RawMessage `json:"line_end"`
+		Suggestion  string          `json:"suggestion"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	s.Category = raw.Category
+	s.Severity = raw.Severity
+	s.Title = raw.Title
+	s.Description = raw.Description
+	s.Suggestion = raw.Suggestion
+	s.Confidence = parseFloat(raw.Confidence, 0.5)
+	s.LineStart = parseOptionalInt(raw.LineStart)
+	s.LineEnd = parseOptionalInt(raw.LineEnd)
+	return nil
+}
+
+// parseFloat parses a JSON value that may be a number or a string containing a number.
+func parseFloat(raw json.RawMessage, fallback float64) float64 {
+	if len(raw) == 0 {
+		return fallback
+	}
+	var f float64
+	if json.Unmarshal(raw, &f) == nil {
+		return f
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		if v, err := strconv.ParseFloat(s, 64); err == nil {
+			return v
+		}
+	}
+	return fallback
+}
+
+// parseOptionalInt parses a JSON value that may be a number, a string, or null.
+func parseOptionalInt(raw json.RawMessage) *int {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var i int
+	if json.Unmarshal(raw, &i) == nil {
+		return &i
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		if v, err := strconv.Atoi(s); err == nil {
+			return &v
+		}
+	}
+	return nil
 }
 
 // ScanMetadata is the metadata extracted from a file scan.

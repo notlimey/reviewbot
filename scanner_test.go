@@ -277,6 +277,14 @@ func TestParseScanResponse(t *testing.T) {
 			input:   `not json at all`,
 			wantErr: true,
 		},
+		{
+			name:  "truncated with raw newlines",
+			input: "{\"issues\":[],\"metadata\":{\"exports\":[],\"imports\":[],\"interfaces\":[],\"patterns\":[],\"summary\":\"Handles file\ndiscovery and ha",
+		},
+		{
+			name:  "numeric fields as strings",
+			input: `{"issues":[{"category":"bug","severity":"high","confidence":"0.9","title":"test","description":"d","line_start":"10","line_end":"12","suggestion":"fix"}],"metadata":{"exports":[],"imports":[],"interfaces":[],"patterns":[],"summary":"x"}}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -296,6 +304,23 @@ func TestParseScanResponse(t *testing.T) {
 				t.Error("got nil response")
 			}
 		})
+	}
+}
+
+func TestScanIssueNumericStrings(t *testing.T) {
+	input := `{"category":"bug","severity":"high","confidence":"0.85","title":"t","description":"d","line_start":"10","line_end":"12","suggestion":"s"}`
+	var issue ScanIssue
+	if err := json.Unmarshal([]byte(input), &issue); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if issue.Confidence != 0.85 {
+		t.Errorf("confidence: got %f, want 0.85", issue.Confidence)
+	}
+	if issue.LineStart == nil || *issue.LineStart != 10 {
+		t.Errorf("line_start: got %v, want 10", issue.LineStart)
+	}
+	if issue.LineEnd == nil || *issue.LineEnd != 12 {
+		t.Errorf("line_end: got %v, want 12", issue.LineEnd)
 	}
 }
 

@@ -318,15 +318,20 @@ func parseScanResponse(raw string) (*ScanResponse, error) {
 		return &resp, nil
 	}
 
-	// 3. Try repairing truncated JSON (on the stripped version, not the
-	//    newline-fixed version, so repair sees the original structure).
+	// 3. Try repairing truncated JSON.
 	repaired := repairTruncatedJSON(stripped)
 	if json.Unmarshal([]byte(repaired), &resp) == nil {
 		return &resp, nil
 	}
 
-	// 4. Last resort: extract just the issues array.
-	if partial := extractPartialScanResponse(repaired); partial != nil {
+	// 4. Try newline-fix + repair combined (truncated JSON with raw newlines).
+	repairedFixed := repairTruncatedJSON(fixed)
+	if json.Unmarshal([]byte(repairedFixed), &resp) == nil {
+		return &resp, nil
+	}
+
+	// 5. Last resort: extract just the issues array.
+	if partial := extractPartialScanResponse(repairedFixed); partial != nil {
 		return partial, nil
 	}
 
