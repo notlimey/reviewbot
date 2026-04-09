@@ -246,24 +246,34 @@ Return ONLY valid JSON:
 }
 
 func parseStructuralResponse(raw string, verbose bool) ([]StructuralIssue, error) {
-	cleaned := cleanJSON(raw)
+	stripped := cleanJSON(raw)
 	if verbose {
-		fmt.Printf("    raw structural response: %s\n", cleaned[:min(len(cleaned), 500)])
+		fmt.Printf("    raw structural response: %s\n", stripped[:min(len(stripped), 500)])
 	}
 
 	// Handle empty responses gracefully
-	if len(strings.TrimSpace(cleaned)) == 0 {
+	if len(strings.TrimSpace(stripped)) == 0 {
 		fmt.Println("    warning: empty structural response, returning no issues")
 		return nil, nil
 	}
 
 	var resp StructuralResponse
-	if err := json.Unmarshal([]byte(cleaned), &resp); err != nil {
-		// Try repairing truncated JSON before giving up
-		repaired := repairTruncatedJSON(cleaned)
-		if err2 := json.Unmarshal([]byte(repaired), &resp); err2 != nil {
-			return nil, fmt.Errorf("parse structural response: %w", err)
-		}
+
+	// 1. Try direct parse.
+	if json.Unmarshal([]byte(stripped), &resp) == nil {
+		return resp.StructuralIssues, nil
+	}
+
+	// 2. Try with newline fixing.
+	fixed := fixNewlinesInStrings(stripped)
+	if json.Unmarshal([]byte(fixed), &resp) == nil {
+		return resp.StructuralIssues, nil
+	}
+
+	// 3. Try repairing truncated JSON.
+	repaired := repairTruncatedJSON(stripped)
+	if err := json.Unmarshal([]byte(repaired), &resp); err != nil {
+		return nil, fmt.Errorf("parse structural response: %w", err)
 	}
 	return resp.StructuralIssues, nil
 }

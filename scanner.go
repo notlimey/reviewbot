@@ -96,7 +96,7 @@ func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool) err
 		fmt.Printf("  … [%d/%d] %s (~%d tokens, %s)\n", scanned, totalPending, f.Path, f.TokenEstimate, f.Language)
 
 		start := time.Now()
-		resp, truncated, err := callLLMForScan(client, model, f.Path, f.Language, string(content))
+		resp, truncated, err := callLLMForScan(client, model, f.Path, f.Language, string(content), f.TokenEstimate)
 		elapsed := time.Since(start)
 
 		if err != nil {
@@ -201,40 +201,25 @@ func saveScanResults(db *sql.DB, fileID int64, parsed *ScanResponse) (int, error
 
 // callLLMForScan streams the response from the LLM, printing a live token counter.
 // Returns the response text, whether it was truncated by the token limit, and any error.
-func callLLMForScan(client *api.Client, model, path, language, content string) (string, bool, error) {
-	prompt := fmt.Sprintf(`You are a senior code reviewer. Review this %s file.
-Focus on real issues: bugs, security vulnerabilities, performance problems, and genuinely bad patterns.
-Do NOT flag minor style issues unless they indicate a real problem.
-Be precise about line numbers when possible.
-Keep descriptions and suggestions concise — one or two sentences each.
+func callLLMForScan(client *api.Client, model, path, language, content string, inputTokens int) (string, bool, error) {
+	prompt := fmt.Sprintf(`Review this %s file. Report ONLY real bugs, security issues, or performance problems. Skip style nits.
 
-Return ONLY valid JSON, no markdown fences, no backticks, no explanation:
-{
-  "issues": [
-    {
-      "category": "bug|security|perf|style",
-      "severity": "critical|high|medium|low",
-      "confidence": 0.0-1.0,
-      "title": "short title",
-      "description": "what is wrong and why it matters",
-      "line_start": null or line number,
-      "line_end": null or line number,
-      "suggestion": "how to fix it"
-    }
-  ],
-  "metadata": {
-    "exports": ["exported class/function/type names"],
-    "imports": [{"from": "module/path", "names": ["imported names"]}],
-    "interfaces": ["public API contracts or type definitions"],
-    "patterns": ["one or two word labels like: repository, middleware, hook, controller, service"],
-    "summary": "One sentence describing what this file does"
-  }
-}
+IMPORTANT: Be extremely concise. Each field value should be 1-2 sentences max. Do NOT repeat code. Do NOT explain obvious things. The entire response must be compact JSON.
 
-If there are no issues, return {"issues": [], "metadata": {...}}.
+Return ONLY this JSON structure:
+{"issues":[{"category":"bug|security|perf|style","severity":"critical|high|medium|low","confidence":0.0-1.0,"title":"short title","description":"what is wrong","line_start":null,"line_end":null,"suggestion":"how to fix"}],"metadata":{"exports":["names"],"imports":[{"from":"path","names":["names"]}],"interfaces":["names"],"patterns":["label"],"summary":"one sentence"}}
+
+If no issues: {"issues":[],"metadata":{"exports":[],"imports":[],"interfaces":[],"patterns":[],"summary":"one sentence"}}
 
 File: %s
 `+"```%s\n%s\n```", language, path, language, content)
+
+	// Scale token budget: base of 2048 + 3x input tokens, capped at 16384.
+	// A well-formed response should be much smaller than the input.
+	maxTokens := 2048 + inputTokens*3
+	if maxTokens > 16384 {
+		maxTokens = 16384
+	}
 
 	stream := true
 	req := &api.ChatRequest{
@@ -244,7 +229,7 @@ File: %s
 		},
 		Stream:  &stream,
 		Format:  json.RawMessage(`"json"`),
-		Options: map[string]any{"temperature": 0.3, "num_predict": 32768},
+		Options: map[string]any{"temperature": 0.3, "num_predict": maxTokens},
 	}
 
 	var response strings.Builder
@@ -255,21 +240,37 @@ File: %s
 		tokenCount := 0
 		truncated := false
 
+		cancelled := false
 		ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
 		lastErr = client.Chat(ctx, req, func(resp api.ChatResponse) error {
-			response.WriteString(resp.Message.Content)
-			tokenCount++
-			if tokenCount%10 == 0 {
-				fmt.Printf("\r    … generating: %d tokens", tokenCount)
+			// Stop accumulating after we've cancelled — buffered
+			// callbacks may still arrive.
+			if cancelled {
+				return nil
+			}
+			if resp.Message.Content != "" {
+				response.WriteString(resp.Message.Content)
+				tokenCount++
+				if tokenCount%10 == 0 {
+					fmt.Printf("\r    … generating: %d tokens", tokenCount)
+				}
 			}
 			if resp.Done && resp.DoneReason == "length" {
 				truncated = true
+			}
+			// Hard cutoff — cancel the stream if we've exceeded our budget.
+			// Ollama's JSON mode can ignore num_predict to complete JSON.
+			if tokenCount >= maxTokens {
+				truncated = true
+				cancelled = true
+				cancel()
 			}
 			return nil
 		})
 		cancel()
 
-		if lastErr == nil {
+		// If we cancelled due to our hard cutoff, treat as success with truncation
+		if lastErr == nil || (truncated && response.Len() > 0) {
 			fmt.Printf("\r    … generated %d tokens            \n", tokenCount)
 			return response.String(), truncated, nil
 		}
@@ -282,6 +283,8 @@ File: %s
 
 // streamLLMChat streams an LLM chat request with a live token counter.
 // Returns the accumulated text, the final ChatResponse (for tool calls), whether truncated, and any error.
+const streamHardLimit = 16384
+
 func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.ChatResponse, string, bool, error) {
 	stream := true
 	req.Stream = &stream
@@ -291,8 +294,12 @@ func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.
 	truncated := false
 	var finalResp api.ChatResponse
 
+	cancelled := false
 	ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
 	err := client.Chat(ctx, req, func(r api.ChatResponse) error {
+		if cancelled {
+			return nil
+		}
 		finalResp = r
 		if r.Message.Content != "" {
 			response.WriteString(r.Message.Content)
@@ -303,6 +310,11 @@ func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.
 		}
 		if r.Done && r.DoneReason == "length" {
 			truncated = true
+		}
+		if tokenCount >= streamHardLimit {
+			truncated = true
+			cancelled = true
+			cancel()
 		}
 		return nil
 	})
@@ -315,38 +327,55 @@ func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.
 	// Put the accumulated content into the final response message
 	finalResp.Message.Content = response.String()
 
+	// If we cancelled due to our hard cutoff, ignore the context error
+	if truncated && response.Len() > 0 {
+		err = nil
+	}
+
 	return finalResp, response.String(), truncated, err
 }
 
 func parseScanResponse(raw string) (*ScanResponse, error) {
-	cleaned := cleanJSON(raw)
+	stripped := cleanJSON(raw)
 	var resp ScanResponse
-	if err := json.Unmarshal([]byte(cleaned), &resp); err != nil {
-		// Try repairing truncated JSON before giving up
-		repaired := repairTruncatedJSON(cleaned)
-		if err2 := json.Unmarshal([]byte(repaired), &resp); err2 != nil {
-			// Last resort: try to extract just the issues array
-			if partial := extractPartialScanResponse(repaired); partial != nil {
-				return partial, nil
-			}
-			return nil, fmt.Errorf("unmarshal: %w", err)
-		}
+
+	// 1. Try direct parse.
+	if json.Unmarshal([]byte(stripped), &resp) == nil {
+		return &resp, nil
 	}
-	return &resp, nil
+
+	// 2. Try with newline fixing (LLM sometimes puts raw newlines in string values).
+	fixed := fixNewlinesInStrings(stripped)
+	if json.Unmarshal([]byte(fixed), &resp) == nil {
+		return &resp, nil
+	}
+
+	// 3. Try repairing truncated JSON (on the stripped version, not the
+	//    newline-fixed version, so repair sees the original structure).
+	repaired := repairTruncatedJSON(stripped)
+	if json.Unmarshal([]byte(repaired), &resp) == nil {
+		return &resp, nil
+	}
+
+	// 4. Last resort: extract just the issues array.
+	if partial := extractPartialScanResponse(repaired); partial != nil {
+		return partial, nil
+	}
+
+	return nil, fmt.Errorf("unmarshal: all parse strategies failed")
 }
 
 // extractPartialScanResponse attempts to salvage a partial response by
 // extracting just the issues array from a malformed JSON object.
 func extractPartialScanResponse(s string) *ScanResponse {
-	// Try to find and parse just the "issues" array
-	issuesKey := `"issues"`
-	idx := strings.Index(s, issuesKey)
+	// Find "issues" as a structural key (not inside a string value).
+	idx := findStructuralKey(s, "issues")
 	if idx < 0 {
 		return nil
 	}
 
-	// Find the start of the array
-	rest := s[idx+len(issuesKey):]
+	// Find the start of the array after "issues":
+	rest := s[idx:]
 	rest = strings.TrimLeft(rest, " \t\n\r:")
 	if len(rest) == 0 || rest[0] != '[' {
 		return nil
@@ -404,6 +433,8 @@ func extractPartialScanResponse(s string) *ScanResponse {
 	return &ScanResponse{Issues: issues}
 }
 
+// cleanJSON strips markdown fences and conversational text around JSON.
+// It does NOT fix newlines or repair truncation — those are separate steps.
 func cleanJSON(s string) string {
 	s = strings.TrimSpace(s)
 
@@ -418,15 +449,94 @@ func cleanJSON(s string) string {
 		s = s[idx:]
 	}
 
-	// If the LLM appended text after the JSON, find the last '}'
-	if idx := strings.LastIndex(s, "}"); idx >= 0 && idx < len(s)-1 {
-		s = s[:idx+1]
+	// If the LLM appended text after the JSON, find the structural closing '}'.
+	// We must walk the JSON properly to avoid cutting at a '}' inside a string.
+	if end := findStructuralEnd(s); end >= 0 && end < len(s)-1 {
+		s = s[:end+1]
 	}
 
-	// Fix unescaped newlines inside JSON string values.
-	s = fixNewlinesInStrings(s)
-
 	return s
+}
+
+// findStructuralEnd walks the string tracking JSON structure and returns the
+// position of the outermost closing bracket/brace, ignoring those inside strings.
+// Uses a stack to properly match '{' with '}' and '[' with ']'.
+// Returns -1 if the top-level structure is never closed (truncated JSON).
+func findStructuralEnd(s string) int {
+	inString := false
+	escaped := false
+	var stack []byte
+	lastClose := -1
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inString {
+			if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			stack = append(stack, '}')
+		case '[':
+			stack = append(stack, ']')
+		case '}', ']':
+			if len(stack) > 0 && stack[len(stack)-1] == c {
+				stack = stack[:len(stack)-1]
+			}
+			if len(stack) == 0 {
+				lastClose = i
+			}
+		}
+	}
+	return lastClose
+}
+
+// findStructuralKey searches for a JSON key by name at any nesting depth,
+// skipping occurrences inside string values. Returns the position just after
+// the closing quote of the key, or -1 if not found.
+func findStructuralKey(s string, key string) int {
+	target := `"` + key + `"`
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inString {
+			if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		// Outside a string: check if this position starts our key
+		if c == '"' && i+len(target) <= len(s) && s[i:i+len(target)] == target {
+			afterKey := i + len(target)
+			// Verify it's followed by ':' (whitespace allowed)
+			rest := strings.TrimLeft(s[afterKey:], " \t\n\r")
+			if len(rest) > 0 && rest[0] == ':' {
+				return afterKey
+			}
+		}
+		if c == '"' {
+			inString = true
+		}
+	}
+	return -1
 }
 
 // repairTruncatedJSON attempts to close an incomplete JSON object that was
@@ -441,11 +551,6 @@ func repairTruncatedJSON(s string) string {
 
 	// Walk the string to find the last position where JSON structure was valid.
 	// Track: are we in a string? What braces/brackets are open?
-	type state struct {
-		pos      int
-		inString bool
-	}
-
 	inString := false
 	escaped := false
 	var stack []byte          // tracks expected closing chars: } or ]
@@ -514,13 +619,24 @@ func repairTruncatedJSON(s string) string {
 			// Dangling colon means we have `"key":` — remove the key too
 			trimmed = trimmed[:len(trimmed)-1] // remove ':'
 			trimmed = strings.TrimRight(trimmed, " \t\n\r")
-			// Now remove the quoted key
+			// Now remove the quoted key by walking backwards to find the
+			// matching opening quote, properly skipping escaped quotes.
 			if len(trimmed) > 0 && trimmed[len(trimmed)-1] == '"' {
-				// Find the matching opening quote
-				inner := trimmed[:len(trimmed)-1]
-				openQuote := strings.LastIndex(inner, "\"")
-				if openQuote >= 0 {
-					trimmed = trimmed[:openQuote]
+				pos := len(trimmed) - 2 // skip the closing quote
+				for pos >= 0 {
+					if trimmed[pos] == '"' {
+						// Count preceding backslashes to check if escaped
+						bs := 0
+						for j := pos - 1; j >= 0 && trimmed[j] == '\\'; j-- {
+							bs++
+						}
+						if bs%2 == 0 {
+							// Not escaped — this is the opening quote
+							trimmed = trimmed[:pos]
+							break
+						}
+					}
+					pos--
 				}
 			}
 			trimmed = strings.TrimRight(trimmed, " \t\n\r")
@@ -607,7 +723,13 @@ func fixNewlinesInStrings(s string) string {
 			continue
 		}
 		if inString && c == '\r' {
-			continue // drop \r, the \n case handles the newline
+			// If followed by \n, skip — the \n case handles the newline.
+			// Standalone \r (classic Mac line endings) gets escaped.
+			if i+1 < len(s) && s[i+1] == '\n' {
+				continue
+			}
+			b.WriteString("\\n")
+			continue
 		}
 		if inString && c == '\t' {
 			b.WriteString("\\t")
