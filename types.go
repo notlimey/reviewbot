@@ -1,6 +1,9 @@
 package main
 
-import "database/sql"
+import (
+	"database/sql"
+	"encoding/json"
+)
 
 // FileRecord represents a row in the files table.
 type FileRecord struct {
@@ -102,6 +105,40 @@ type ScanMetadata struct {
 type ImportRecord struct {
 	From  string   `json:"from"`
 	Names []string `json:"names"`
+}
+
+// UnmarshalJSON handles the case where the LLM returns "names" as a single
+// string instead of an array of strings.
+func (r *ImportRecord) UnmarshalJSON(data []byte) error {
+	// Use a raw struct to avoid infinite recursion.
+	var raw struct {
+		From  string          `json:"from"`
+		Names json.RawMessage `json:"names"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	r.From = raw.From
+
+	if len(raw.Names) == 0 {
+		return nil
+	}
+
+	// Try []string first (expected case).
+	if err := json.Unmarshal(raw.Names, &r.Names); err == nil {
+		return nil
+	}
+
+	// Fall back to a single string.
+	var single string
+	if err := json.Unmarshal(raw.Names, &single); err == nil {
+		r.Names = []string{single}
+		return nil
+	}
+
+	// Ignore unparseable names rather than failing the whole file.
+	r.Names = nil
+	return nil
 }
 
 // StructuralResponse is the expected JSON from the structural review LLM.

@@ -226,8 +226,8 @@ Return ONLY valid JSON, no markdown fences, no backticks, no explanation:
     "exports": ["exported class/function/type names"],
     "imports": [{"from": "module/path", "names": ["imported names"]}],
     "interfaces": ["public API contracts or type definitions"],
-    "patterns": ["repository", "middleware", "hook", "controller", "service", etc],
-    "summary": "2-3 sentence description of what this file does and its role"
+    "patterns": ["one or two word labels like: repository, middleware, hook, controller, service"],
+    "summary": "One sentence describing what this file does"
   }
 }
 
@@ -244,7 +244,7 @@ File: %s
 		},
 		Stream:  &stream,
 		Format:  json.RawMessage(`"json"`),
-		Options: map[string]any{"temperature": 0.3, "num_predict": 16384},
+		Options: map[string]any{"temperature": 0.3, "num_predict": 32768},
 	}
 
 	var response strings.Builder
@@ -325,10 +325,83 @@ func parseScanResponse(raw string) (*ScanResponse, error) {
 		// Try repairing truncated JSON before giving up
 		repaired := repairTruncatedJSON(cleaned)
 		if err2 := json.Unmarshal([]byte(repaired), &resp); err2 != nil {
+			// Last resort: try to extract just the issues array
+			if partial := extractPartialScanResponse(repaired); partial != nil {
+				return partial, nil
+			}
 			return nil, fmt.Errorf("unmarshal: %w", err)
 		}
 	}
 	return &resp, nil
+}
+
+// extractPartialScanResponse attempts to salvage a partial response by
+// extracting just the issues array from a malformed JSON object.
+func extractPartialScanResponse(s string) *ScanResponse {
+	// Try to find and parse just the "issues" array
+	issuesKey := `"issues"`
+	idx := strings.Index(s, issuesKey)
+	if idx < 0 {
+		return nil
+	}
+
+	// Find the start of the array
+	rest := s[idx+len(issuesKey):]
+	rest = strings.TrimLeft(rest, " \t\n\r:")
+	if len(rest) == 0 || rest[0] != '[' {
+		return nil
+	}
+
+	// Find the matching ']'
+	depth := 0
+	inStr := false
+	esc := false
+	end := -1
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if inStr {
+			if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				end = i + 1
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+
+	if end < 0 {
+		// Array wasn't closed — repair it
+		arr := repairTruncatedJSON(rest)
+		var issues []ScanIssue
+		if err := json.Unmarshal([]byte(arr), &issues); err != nil {
+			return nil
+		}
+		return &ScanResponse{Issues: issues}
+	}
+
+	var issues []ScanIssue
+	if err := json.Unmarshal([]byte(rest[:end]), &issues); err != nil {
+		return nil
+	}
+	return &ScanResponse{Issues: issues}
 }
 
 func cleanJSON(s string) string {

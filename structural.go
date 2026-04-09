@@ -188,7 +188,7 @@ Return ONLY valid JSON:
 			Messages: messages,
 			Tools:    tools,
 			Format:   json.RawMessage(`"json"`),
-			Options:  map[string]any{"temperature": 0.3, "num_predict": 16384},
+			Options:  map[string]any{"temperature": 0.3, "num_predict": 32768},
 		}
 
 		resp, _, _, err := streamLLMChat(client, req, "structural")
@@ -228,7 +228,7 @@ Return ONLY valid JSON:
 					Model:    model,
 					Messages: messages,
 					Format:   json.RawMessage(`"json"`),
-					Options:  map[string]any{"temperature": 0.3, "num_predict": 16384},
+					Options:  map[string]any{"temperature": 0.3, "num_predict": 32768},
 				}
 				finalResp, _, _, err := streamLLMChat(client, finalReq, "final analysis")
 				if err != nil {
@@ -249,6 +249,12 @@ func parseStructuralResponse(raw string, verbose bool) ([]StructuralIssue, error
 	cleaned := cleanJSON(raw)
 	if verbose {
 		fmt.Printf("    raw structural response: %s\n", cleaned[:min(len(cleaned), 500)])
+	}
+
+	// Handle empty responses gracefully
+	if len(strings.TrimSpace(cleaned)) == 0 {
+		fmt.Println("    warning: empty structural response, returning no issues")
+		return nil, nil
 	}
 
 	var resp StructuralResponse
