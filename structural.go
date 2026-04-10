@@ -15,7 +15,6 @@ import (
 const (
 	structuralTimeout    = 5 * time.Minute
 	structuralNumPredict = 8192
-	structuralNumCtx     = 65536
 )
 
 func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay int, verbose bool) error {
@@ -192,7 +191,7 @@ Return ONLY valid JSON:
 			Messages: messages,
 			Tools:    tools,
 			Format:   json.RawMessage(`"json"`),
-			Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict, "num_ctx": structuralNumCtx},
+			Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict},
 		}
 
 		resp, _, _, err := streamLLMChat(client, req, "structural")
@@ -232,7 +231,7 @@ Return ONLY valid JSON:
 					Model:    model,
 					Messages: messages,
 					Format:   json.RawMessage(`"json"`),
-					Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict, "num_ctx": structuralNumCtx},
+					Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict},
 				}
 				finalResp, _, _, err := streamLLMChat(client, finalReq, "final analysis")
 				if err != nil {

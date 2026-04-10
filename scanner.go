@@ -15,8 +15,7 @@ import (
 
 const (
 	llmTimeout     = 10 * time.Minute
-	scanNumPredict = 4096  // output limit per file — keeps responses concise
-	scanNumCtx     = 32768 // total context window — must fit prompt + output
+	scanNumPredict = 4096 // output limit per file — keeps responses concise
 )
 
 func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool) error {
@@ -227,7 +226,6 @@ File: %s
 		Options: map[string]any{
 			"temperature": 0.3,
 			"num_predict": scanNumPredict,
-			"num_ctx":     scanNumCtx,
 		},
 	}
 
