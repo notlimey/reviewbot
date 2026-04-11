@@ -164,6 +164,7 @@ func renderCommands(running bool) string {
 	b.WriteString(keyStyle.Render("[s]") + mutedStyle.Render(" scan  "))
 	b.WriteString(keyStyle.Render("[r]") + mutedStyle.Render(" relations  "))
 	b.WriteString(keyStyle.Render("[t]") + mutedStyle.Render(" structural  "))
+	b.WriteString(keyStyle.Render("[c]") + mutedStyle.Render(" architecture  "))
 	b.WriteString(keyStyle.Render("[p]") + mutedStyle.Render(" report\n"))
 	b.WriteString(keyStyle.Render("[a]") + mutedStyle.Render(" run all  "))
 	b.WriteString(keyStyle.Render("[f]") + mutedStyle.Render(" findings  "))

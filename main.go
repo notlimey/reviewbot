@@ -93,6 +93,8 @@ func main() {
 		err = runRelations(db, prog)
 	case "structural":
 		err = runStructural(db, projectRoot, *modelFlag, *maxToolsFlag, *delayFlag, *verboseFlag, prog)
+	case "architecture":
+		err = runArchitecture(db, projectRoot, *modelFlag, *verboseFlag, prog)
 	case "report":
 		err = runReport(db, *modelFlag, *reportFlag, runID, prog)
 	case "status":
@@ -152,7 +154,12 @@ func runAll(db *sql.DB, projectRoot, model string, delay, maxTools int, verbose 
 		return updateRunStatus(db, runID, "failed", err)
 	}
 
-	prog.PassHeader("Pass 5: Report")
+	prog.PassHeader("Pass 5: Architecture Review")
+	if err := runArchitecture(db, projectRoot, model, verbose, prog); err != nil {
+		return updateRunStatus(db, runID, "failed", err)
+	}
+
+	prog.PassHeader("Pass 6: Report")
 	if err := runReport(db, model, reportPath, runID, prog); err != nil {
 		return updateRunStatus(db, runID, "failed", err)
 	}
@@ -295,7 +302,9 @@ func runScanFile(filePath, model string, verbose bool, prog Progress) error {
 	}
 
 	start := time.Now()
-	resp, truncated, err := callLLMForScan(client, model, filePath, lang, string(content), tokenEstimate, prog)
+	// Load project context from the file's directory
+	projectCtx := loadProjectContext(filepath.Dir(absPath))
+	resp, truncated, err := callLLMForScan(client, model, filePath, lang, string(content), tokenEstimate, projectCtx, prog)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -366,7 +375,8 @@ Commands:
   scan-file     Review a single file (no DB, quick test)
   relations     Pass 3 — build dependency graph from extracted metadata
   structural    Pass 4 — cross-file analysis with tool calling
-  report        Pass 5 — generate markdown report
+  architecture  Pass 5 — project-wide architecture review
+  report        Pass 6 — generate markdown report
   status        Show current progress
   all           Run full pipeline (pass 1 through 5)
   reset         Drop all tables and start fresh

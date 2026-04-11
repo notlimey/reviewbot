@@ -58,10 +58,56 @@ func scanNumPredict(tokenEstimate int) int {
 	}
 }
 
+// loadProjectContext reads README.md and CLAUDE.md from the project root to
+// give the LLM context about the tech stack, conventions, and architecture.
+// Returns a short summary string (capped at 2000 chars) or empty string.
+func loadProjectContext(absRoot string) string {
+	candidates := []string{"CLAUDE.md", "claude.md", "README.md", "readme.md"}
+	var parts []string
+	totalLen := 0
+	const maxLen = 2000
+
+	for _, name := range candidates {
+		data, err := os.ReadFile(filepath.Join(absRoot, name))
+		if err != nil {
+			continue
+		}
+		content := strings.TrimSpace(string(data))
+		if content == "" {
+			continue
+		}
+		// Truncate individual files to leave room for others
+		if len(content) > 1200 {
+			content = content[:1200] + "\n[truncated]"
+		}
+		part := fmt.Sprintf("--- %s ---\n%s", name, content)
+		if totalLen+len(part) > maxLen {
+			remaining := maxLen - totalLen
+			if remaining > 100 {
+				parts = append(parts, part[:remaining]+"\n[truncated]")
+			}
+			break
+		}
+		parts = append(parts, part)
+		totalLen += len(part)
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool, prog Progress) error {
 	absRoot, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("resolve project root: %w", err)
+	}
+
+	// Load project context (README, CLAUDE.md) for the LLM
+	projectCtx := loadProjectContext(absRoot)
+	if projectCtx != "" {
+		prog.Info("Loaded project context from README/CLAUDE.md")
 	}
 
 	// Reset any files stuck in 'scanning' from a previous crash
@@ -121,6 +167,7 @@ func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool, pro
 			total:         totalPending,
 			verbose:       verbose,
 			prog:          prog,
+			projectCtx:    projectCtx,
 		})
 
 		switch result.status {
@@ -162,15 +209,16 @@ const (
 )
 
 type scanFileInput struct {
-	db      *sql.DB
-	client  *api.Client
-	absRoot string
-	model   string
-	file    FileRecord
-	n       int
-	total   int
-	verbose bool
-	prog    Progress
+	db         *sql.DB
+	client     *api.Client
+	absRoot    string
+	model      string
+	file       FileRecord
+	n          int
+	total      int
+	verbose    bool
+	prog       Progress
+	projectCtx string // README/CLAUDE.md content for stack context
 }
 
 type scanFileResult struct {
@@ -215,7 +263,7 @@ func scanFile(in scanFileInput) scanFileResult {
 
 	// ── LLM call ───────────────────────────────────────────────────────
 	start := time.Now()
-	resp, truncated, err := callLLMForScan(in.client, in.model, f.Path, f.Language, string(content), f.TokenEstimate, in.prog)
+	resp, truncated, err := callLLMForScan(in.client, in.model, f.Path, f.Language, string(content), f.TokenEstimate, in.projectCtx, in.prog)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -235,6 +283,7 @@ func scanFile(in scanFileInput) scanFileResult {
 		truncated:     truncated,
 		verbose:       in.verbose,
 		prog:          in.prog,
+		projectCtx:    in.projectCtx,
 	})
 	if err != nil {
 		in.prog.ScanFileError(in.n, in.total, f.Path, fmt.Sprintf("parse error: %v", err))
@@ -334,6 +383,7 @@ type recoverCtx struct {
 	truncated     bool
 	verbose       bool
 	prog          Progress
+	projectCtx    string
 }
 
 // recoverScanResponse runs the recovery pipeline and returns a post-filtered
@@ -399,6 +449,8 @@ DO NOT REPORT any of these — they are NOT bugs:
 - Default/fallback return values in parser helpers — returning a default for unparseable input is intentional
 - Standard resource cleanup patterns (e.g. defer rows.Close() after a query)
 - Hardcoded constants used in SQL DDL (e.g. DROP TABLE with a fixed table name list)
+- JSX/HTML tag structure issues (unclosed tags, mismatched tags) — LLMs cannot reliably track tag nesting, and compilers already catch these
+- Framework-specific patterns that are documented and correct (e.g. SolidJS signal accessors, React hooks, Mapbox GL conventions, GeoJSON coordinate order [lon, lat])
 
 LINE NUMBERS: The code has line numbers. Use them in line_start/line_end. Only report a line range if you can point to the exact lines.
 
@@ -409,13 +461,19 @@ If no issues: {"issues":[],"metadata":{"exports":[],"imports":[],"interfaces":[]
 
 // callLLMForScan sends a file to the LLM for review and returns the raw
 // response, whether it was truncated, and any error.
-func callLLMForScan(client *api.Client, model, path, language, content string, tokenEstimate int, prog Progress) (string, bool, error) {
+func callLLMForScan(client *api.Client, model, path, language, content string, tokenEstimate int, projectCtx string, prog Progress) (string, bool, error) {
 	// Add line numbers so the model can reference exact lines
 	numberedContent := addLineNumbers(content)
 
 	// Dynamic per-file content — only this part changes between files.
-	userMsg := fmt.Sprintf("Review this %s file.\n\nFile: %s\n```%s\n%s\n```",
-		language, path, language, numberedContent)
+	var userMsg string
+	if projectCtx != "" {
+		userMsg = fmt.Sprintf("PROJECT CONTEXT (tech stack, conventions — do NOT review this, use it to understand the codebase):\n%s\n\n---\n\nReview this %s file.\n\nFile: %s\n```%s\n%s\n```",
+			projectCtx, language, path, language, numberedContent)
+	} else {
+		userMsg = fmt.Sprintf("Review this %s file.\n\nFile: %s\n```%s\n%s\n```",
+			language, path, language, numberedContent)
+	}
 
 	numPredict := scanNumPredict(tokenEstimate)
 	numCtx := scanContextTier(tokenEstimate, numPredict)
@@ -975,6 +1033,13 @@ var falsePositivePatterns = []string{
 	"instead of the actual *sql.db",
 	"instead of the actual database",
 	"receives an incorrect type or value",
+	// JSX/HTML hallucinations: model can't mentally track tag nesting
+	"unclosed div",
+	"unclosed tag",
+	"mismatched closing",
+	"missing closing tag",
+	"unclosed html",
+	"unclosed jsx",
 }
 
 func keepFinding(issue ScanIssue) bool {

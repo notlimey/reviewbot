@@ -245,6 +245,10 @@ func (m model) handleDashboardKey(key string) (tea.Model, tea.Cmd) {
 		return m, m.startPass("Structural", func(prog Progress) error {
 			return runStructural(m.db, m.projectRoot, m.model, m.maxTools, m.delay, m.verbose, prog)
 		})
+	case "c":
+		return m, m.startPass("Architecture", func(prog Progress) error {
+			return runArchitecture(m.db, m.projectRoot, m.model, m.verbose, prog)
+		})
 	case "p":
 		runID := time.Now().Format("20060102-150405")
 		return m, m.startPass("Report", func(prog Progress) error {
@@ -326,6 +330,7 @@ func renderHelp() string {
 	help += "  " + keyStyle.Render("s") + mutedStyle.Render("  Run scan (LLM review per file)") + "\n"
 	help += "  " + keyStyle.Render("r") + mutedStyle.Render("  Run relations (build dependency graph)") + "\n"
 	help += "  " + keyStyle.Render("t") + mutedStyle.Render("  Run structural (cross-file analysis)") + "\n"
+	help += "  " + keyStyle.Render("c") + mutedStyle.Render("  Run architecture (project-wide review)") + "\n"
 	help += "  " + keyStyle.Render("p") + mutedStyle.Render("  Run report (generate markdown)") + "\n"
 	help += "  " + keyStyle.Render("a") + mutedStyle.Render("  Run all passes (full pipeline)") + "\n"
 	help += "  " + keyStyle.Render("f") + mutedStyle.Render("  Browse findings") + "\n"

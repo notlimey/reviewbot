@@ -163,24 +163,57 @@ func runReport(db *sql.DB, model, reportPath, runID string, prog Progress) error
 
 	b.WriteString("---\n\n")
 
-	// Structural findings
+	// Architecture findings (project-wide)
+	b.WriteString("## Architecture\n\n")
+	archRows, err := db.Query(`
+		SELECT category, severity, title, description
+		FROM structural_findings WHERE cluster_id = ?
+		ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+	`, architectureClusterID)
+	if err != nil {
+		return fmt.Errorf("query architecture findings: %w", err)
+	}
+	defer archRows.Close()
+
+	archCount := 0
+	for archRows.Next() {
+		var cat, sev, title, desc string
+		if err := archRows.Scan(&cat, &sev, &title, &desc); err != nil {
+			return fmt.Errorf("scan architecture finding: %w", err)
+		}
+		archCount++
+		b.WriteString(fmt.Sprintf("### [%s] %s\n", strings.ToUpper(sev), title))
+		b.WriteString(fmt.Sprintf("- **Category:** %s\n", cat))
+		b.WriteString(fmt.Sprintf("- **Issue:** %s\n\n", desc))
+	}
+	if err := archRows.Err(); err != nil {
+		return fmt.Errorf("iterate architecture findings: %w", err)
+	}
+	if archCount == 0 {
+		b.WriteString("No architecture issues found.\n\n")
+	}
+
+	b.WriteString("---\n\n")
+
+	// Structural findings (per-directory clusters)
 	b.WriteString("## Structural Issues\n\n")
 	sRows, err := db.Query(`
 		SELECT cluster_id, category, severity, title, description
-		FROM structural_findings
+		FROM structural_findings WHERE cluster_id != ?
 		ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
-	`)
+	`, architectureClusterID)
 	if err != nil {
 		return fmt.Errorf("query structural findings: %w", err)
 	}
 	defer sRows.Close()
 
+	structCount := 0
 	for sRows.Next() {
 		var cluster, cat, sev, title, desc string
 		if err := sRows.Scan(&cluster, &cat, &sev, &title, &desc); err != nil {
 			return fmt.Errorf("scan structural finding: %w", err)
 		}
-
+		structCount++
 		b.WriteString(fmt.Sprintf("### [%s] %s\n", strings.ToUpper(sev), title))
 		b.WriteString(fmt.Sprintf("- **Cluster:** `%s`\n", cluster))
 		b.WriteString(fmt.Sprintf("- **Category:** %s\n", cat))
@@ -190,7 +223,7 @@ func runReport(db *sql.DB, model, reportPath, runID string, prog Progress) error
 		return fmt.Errorf("iterate structural findings: %w", err)
 	}
 
-	if structuralCount == 0 {
+	if structCount == 0 {
 		b.WriteString("No structural issues found.\n\n")
 	}
 
