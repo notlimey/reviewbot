@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func runReport(db *sql.DB, model, reportPath, runID string) error {
+func runReport(db *sql.DB, model, reportPath, runID string, prog Progress) error {
 	var b strings.Builder
 
 	// Header
@@ -185,7 +185,6 @@ func runReport(db *sql.DB, model, reportPath, runID string) error {
 		return fmt.Errorf("write report: %w", err)
 	}
 
-	fmt.Printf("Report written to %s (%d findings, %d structural issues)\n",
-		reportPath, totalFindings, structuralCount)
+	prog.ReportComplete(reportPath, totalFindings, structuralCount)
 	return nil
 }

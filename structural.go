@@ -17,7 +17,7 @@ const (
 	structuralNumPredict = 8192
 )
 
-func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay int, verbose bool) error {
+func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay int, verbose bool, prog Progress) error {
 	absRoot, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("resolve project root: %w", err)
@@ -70,18 +70,18 @@ func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay in
 
 	clusterCount := len(sortedDirs)
 	if clusterCount == 0 {
-		fmt.Println("No multi-file clusters to analyse.")
+		prog.Info("No multi-file clusters to analyse.")
 		return nil
 	}
 
-	fmt.Printf("Analysing %d clusters with structural review...\n", clusterCount)
+	prog.StructuralStart(clusterCount)
 
 	reviewed := 0
 	for _, dir := range sortedDirs {
 		files := clusters[dir]
 		reviewed++
 
-		fmt.Printf("  [%d/%d] Cluster: %s (%d files)\n", reviewed, clusterCount, dir, len(files))
+		prog.StructuralClusterStart(reviewed, clusterCount, dir, len(files))
 
 		// Build cluster context
 		var contextBuilder strings.Builder
@@ -115,9 +115,9 @@ func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay in
 		}
 
 		// Run structural review with tool calling
-		issues, err := structuralReview(client, registry, model, contextBuilder.String(), maxTools, verbose)
+		issues, err := structuralReview(client, registry, model, contextBuilder.String(), maxTools, verbose, prog)
 		if err != nil {
-			fmt.Printf("    ✗ error: %v\n", err)
+			prog.ScanFileError(reviewed, clusterCount, dir, fmt.Sprintf("error: %v", err))
 			continue
 		}
 
@@ -130,22 +130,22 @@ func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay in
 				dir, string(fileIDsJSON), issue.Category, issue.Severity, issue.Title, issue.Description,
 			)
 			if err != nil {
-				fmt.Printf("    warning: failed to save structural finding: %v\n", err)
+				prog.Warn(fmt.Sprintf("failed to save structural finding: %v", err))
 			}
 		}
 
-		fmt.Printf("    ✓ %d structural issues found\n", len(issues))
+		prog.StructuralClusterDone(reviewed, clusterCount, len(issues))
 
 		if delay > 0 && reviewed < clusterCount {
 			time.Sleep(time.Duration(delay) * time.Second)
 		}
 	}
 
-	fmt.Printf("Structural review complete: %d clusters analysed\n", reviewed)
+	prog.StructuralComplete(reviewed)
 	return nil
 }
 
-func structuralReview(client *api.Client, registry *ToolRegistry, model, clusterContext string, maxTools int, verbose bool) ([]StructuralIssue, error) {
+func structuralReview(client *api.Client, registry *ToolRegistry, model, clusterContext string, maxTools int, verbose bool, prog Progress) ([]StructuralIssue, error) {
 	systemPrompt := `You are a senior architect reviewing a cluster of related files for cross-cutting issues.
 You have access to tools to explore the codebase. Use them to understand relationships.
 
@@ -191,10 +191,10 @@ Return ONLY valid JSON:
 			Messages: messages,
 			Tools:    tools,
 			Format:   json.RawMessage(`"json"`),
-			Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict},
+			Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict, "num_ctx": 32768},
 		}
 
-		resp, _, _, err := streamLLMChat(client, req, "structural")
+		resp, _, _, err := streamLLMChat(client, req, "structural", prog)
 		if err != nil {
 			return nil, fmt.Errorf("chat error: %w", err)
 		}
@@ -206,7 +206,7 @@ Return ONLY valid JSON:
 			for _, tc := range resp.Message.ToolCalls {
 				toolCallCount++
 				if verbose {
-					fmt.Printf("    tool call [%d]: %s(%v)\n", toolCallCount, tc.Function.Name, tc.Function.Arguments)
+					prog.Info(fmt.Sprintf("    tool call [%d]: %s(%v)", toolCallCount, tc.Function.Name, tc.Function.Arguments))
 				}
 
 				result, err := registry.Execute(tc.Function.Name, tc.Function.Arguments.ToMap())
@@ -231,32 +231,32 @@ Return ONLY valid JSON:
 					Model:    model,
 					Messages: messages,
 					Format:   json.RawMessage(`"json"`),
-					Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict},
+					Options: map[string]any{"temperature": 0.3, "num_predict": structuralNumPredict, "num_ctx": 32768},
 				}
-				finalResp, _, _, err := streamLLMChat(client, finalReq, "final analysis")
+				finalResp, _, _, err := streamLLMChat(client, finalReq, "final analysis", prog)
 				if err != nil {
 					return nil, fmt.Errorf("final chat error: %w", err)
 				}
-				return parseStructuralResponse(finalResp.Message.Content, verbose)
+				return parseStructuralResponse(finalResp.Message.Content, verbose, prog)
 			}
 
 			continue
 		}
 
 		// No tool calls — parse the final response
-		return parseStructuralResponse(resp.Message.Content, verbose)
+		return parseStructuralResponse(resp.Message.Content, verbose, prog)
 	}
 }
 
-func parseStructuralResponse(raw string, verbose bool) ([]StructuralIssue, error) {
+func parseStructuralResponse(raw string, verbose bool, prog Progress) ([]StructuralIssue, error) {
 	stripped := cleanJSON(raw)
 	if verbose {
-		fmt.Printf("    raw structural response: %s\n", stripped[:min(len(stripped), 500)])
+		prog.Info(fmt.Sprintf("    raw structural response: %s", stripped[:min(len(stripped), 500)]))
 	}
 
 	// Handle empty responses gracefully
 	if len(strings.TrimSpace(stripped)) == 0 {
-		fmt.Println("    warning: empty structural response, returning no issues")
+		prog.Warn("empty structural response, returning no issues")
 		return nil, nil
 	}
 
@@ -275,7 +275,13 @@ func parseStructuralResponse(raw string, verbose bool) ([]StructuralIssue, error
 
 	// 3. Try repairing truncated JSON.
 	repaired := repairTruncatedJSON(stripped)
-	if err := json.Unmarshal([]byte(repaired), &resp); err != nil {
+	if json.Unmarshal([]byte(repaired), &resp) == nil {
+		return resp.StructuralIssues, nil
+	}
+
+	// 4. Try newline-fix + repair combined (truncated JSON with raw newlines).
+	repairedFixed := repairTruncatedJSON(fixed)
+	if err := json.Unmarshal([]byte(repairedFixed), &resp); err != nil {
 		return nil, fmt.Errorf("parse structural response: %w", err)
 	}
 	return resp.StructuralIssues, nil

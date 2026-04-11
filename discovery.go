@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-func runDiscovery(db *sql.DB, projectRoot string) error {
+func runDiscovery(db *sql.DB, projectRoot string, prog Progress) error {
 	absRoot, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("resolve project root: %w", err)
@@ -21,15 +21,15 @@ func runDiscovery(db *sql.DB, projectRoot string) error {
 
 	// If it's a git repo, use git to get non-ignored files
 	if isGitRepo(absRoot) {
-		fmt.Println("Git repo detected — respecting .gitignore")
-		return discoverWithGit(db, absRoot)
+		prog.Info("Git repo detected — respecting .gitignore")
+		return discoverWithGit(db, absRoot, prog)
 	}
 
-	return discoverWithWalk(db, absRoot)
+	return discoverWithWalk(db, absRoot, prog)
 }
 
 // discoverWithGit uses `git ls-files` to list only non-ignored files.
-func discoverWithGit(db *sql.DB, absRoot string) error {
+func discoverWithGit(db *sql.DB, absRoot string, prog Progress) error {
 	var totalFound, newChanged, skipped int
 
 	// -co: cached (tracked) + others (untracked but not ignored)
@@ -39,8 +39,8 @@ func discoverWithGit(db *sql.DB, absRoot string) error {
 
 	out, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("  git ls-files failed, falling back to walk: %v\n", err)
-		return discoverWithWalk(db, absRoot)
+		prog.Warn(fmt.Sprintf("git ls-files failed, falling back to walk: %v", err))
+		return discoverWithWalk(db, absRoot, prog)
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
@@ -63,7 +63,7 @@ func discoverWithGit(db *sql.DB, absRoot string) error {
 		absPath := filepath.Join(absRoot, relPath)
 		content, err := os.ReadFile(absPath)
 		if err != nil {
-			fmt.Printf("  skip (read error): %s\n", relPath)
+			prog.Warn(fmt.Sprintf("skip (read error): %s", relPath))
 			continue
 		}
 
@@ -91,20 +91,19 @@ func discoverWithGit(db *sql.DB, absRoot string) error {
 			)
 		}
 		if err != nil {
-			fmt.Printf("  db error for %s: %v\n", relPath, err)
+			prog.Warn(fmt.Sprintf("db error for %s: %v", relPath, err))
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("scan git output: %w", err)
 	}
 
-	fmt.Printf("Discovery complete: %d files found, %d new/changed, %d unchanged (skipped)\n",
-		totalFound, newChanged, skipped)
+	prog.DiscoveryComplete(totalFound, newChanged, skipped)
 	return nil
 }
 
 // discoverWithWalk is the fallback for non-git directories.
-func discoverWithWalk(db *sql.DB, absRoot string) error {
+func discoverWithWalk(db *sql.DB, absRoot string, prog Progress) error {
 	var totalFound, newChanged, skipped int
 
 	err := filepath.WalkDir(absRoot, func(path string, d fs.DirEntry, err error) error {
@@ -129,7 +128,7 @@ func discoverWithWalk(db *sql.DB, absRoot string) error {
 
 		content, err := os.ReadFile(path)
 		if err != nil {
-			fmt.Printf("  skip (read error): %s\n", path)
+			prog.Warn(fmt.Sprintf("skip (read error): %s", path))
 			return nil
 		}
 
@@ -158,7 +157,7 @@ func discoverWithWalk(db *sql.DB, absRoot string) error {
 			)
 		}
 		if err != nil {
-			fmt.Printf("  db error for %s: %v\n", relPath, err)
+			prog.Warn(fmt.Sprintf("db error for %s: %v", relPath, err))
 		}
 
 		return nil
@@ -168,8 +167,7 @@ func discoverWithWalk(db *sql.DB, absRoot string) error {
 		return fmt.Errorf("walk directory: %w", err)
 	}
 
-	fmt.Printf("Discovery complete: %d files found, %d new/changed, %d unchanged (skipped)\n",
-		totalFound, newChanged, skipped)
+	prog.DiscoveryComplete(totalFound, newChanged, skipped)
 	return nil
 }
 

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 )
 
-func runRelations(db *sql.DB) error {
+func runRelations(db *sql.DB, prog Progress) error {
 	// Build export map: exportName -> []fileID (multiple files can export the same name)
 	exportMap := make(map[string][]int64)
 
@@ -112,7 +112,7 @@ func runRelations(db *sql.DB) error {
 	totalRelations := 0
 	for _, r := range pending {
 		if _, err := stmt.Exec(r.sourceFileID, r.targetFileID, r.detail, r.clusterID); err != nil {
-			fmt.Printf("  warning: insert relation: %v\n", err)
+			prog.Warn(fmt.Sprintf("insert relation: %v", err))
 			continue
 		}
 		totalRelations++
@@ -122,6 +122,6 @@ func runRelations(db *sql.DB) error {
 		return fmt.Errorf("commit: %w", err)
 	}
 
-	fmt.Printf("Built %d relations from %d exports\n", totalRelations, totalExports)
+	prog.RelationsComplete(totalRelations, totalExports)
 	return nil
 }

@@ -5,31 +5,74 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
+
+	"github.com/ollama/ollama/api"
+	"golang.org/x/term"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
-	}
-
-	command := os.Args[1]
-
-	fs := flag.NewFlagSet(command, flag.ExitOnError)
+	// Global flags (parsed before command dispatch)
+	fs := flag.NewFlagSet("reviewbot", flag.ExitOnError)
 	modelFlag := fs.String("model", "gemma4:26b", "Ollama model name")
 	dbFlag := fs.String("db", "review.db", "SQLite database path")
 	delayFlag := fs.Int("delay", 2, "Seconds between LLM calls for thermal management")
 	reportFlag := fs.String("report", "review_report.md", "Output report path")
 	maxToolsFlag := fs.Int("max-tools", 10, "Max tool calls per structural review turn")
 	verboseFlag := fs.Bool("verbose", false, "Print raw LLM responses for debugging")
+	noTuiFlag := fs.Bool("no-tui", false, "Disable interactive TUI, use plain CLI output")
 
-	// Parse flags — positional args end up in fs.Args()
+	// If no args or first arg starts with "-", launch TUI
+	if len(os.Args) < 2 || os.Args[1][0] == '-' {
+		fs.Parse(os.Args[1:])
+		projectRoot := fs.Arg(0)
+		if projectRoot == "" {
+			projectRoot = "."
+		}
+
+		db, err := initDB(*dbFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+
+		// Launch TUI if interactive terminal and not disabled
+		if !*noTuiFlag && term.IsTerminal(int(os.Stdin.Fd())) {
+			if err := startTUI(db, projectRoot, *modelFlag, *dbFlag, *reportFlag, *delayFlag, *maxToolsFlag, *verboseFlag); err != nil {
+				fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+
+		printUsage()
+		return
+	}
+
+	command := os.Args[1]
 	fs.Parse(os.Args[2:])
 
 	projectRoot := fs.Arg(0)
 	if projectRoot == "" && needsProjectRoot(command) {
 		projectRoot = "."
+	}
+
+	prog := &cliProgress{}
+
+	// scan-file is self-contained — no DB needed
+	if command == "scan-file" {
+		filePath := fs.Arg(0)
+		if filePath == "" {
+			fmt.Fprintln(os.Stderr, "Usage: reviewbot scan-file <file>")
+			os.Exit(1)
+		}
+		if err := runScanFile(filePath, *modelFlag, *verboseFlag, prog); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	db, err := initDB(*dbFlag)
@@ -43,19 +86,19 @@ func main() {
 
 	switch command {
 	case "discover":
-		err = runDiscovery(db, projectRoot)
+		err = runDiscovery(db, projectRoot, prog)
 	case "scan":
-		err = runScan(db, projectRoot, *modelFlag, *delayFlag, *verboseFlag)
+		err = runScan(db, projectRoot, *modelFlag, *delayFlag, *verboseFlag, prog)
 	case "relations":
-		err = runRelations(db)
+		err = runRelations(db, prog)
 	case "structural":
-		err = runStructural(db, projectRoot, *modelFlag, *maxToolsFlag, *delayFlag, *verboseFlag)
+		err = runStructural(db, projectRoot, *modelFlag, *maxToolsFlag, *delayFlag, *verboseFlag, prog)
 	case "report":
-		err = runReport(db, *modelFlag, *reportFlag, runID)
+		err = runReport(db, *modelFlag, *reportFlag, runID, prog)
 	case "status":
 		err = runStatus(db)
 	case "all":
-		err = runAll(db, projectRoot, *modelFlag, *delayFlag, *maxToolsFlag, *verboseFlag, *reportFlag, runID)
+		err = runAll(db, projectRoot, *modelFlag, *delayFlag, *maxToolsFlag, *verboseFlag, *reportFlag, runID, prog)
 	case "reset":
 		err = resetDB(db)
 		if err == nil {
@@ -75,63 +118,63 @@ func main() {
 
 func needsProjectRoot(cmd string) bool {
 	switch cmd {
-	case "status", "report", "relations", "reset":
+	case "status", "report", "relations", "reset", "scan-file":
 		return false
 	default:
 		return true
 	}
 }
 
-func runAll(db *sql.DB, projectRoot, model string, delay, maxTools int, verbose bool, reportPath, runID string) error {
+func runAll(db *sql.DB, projectRoot, model string, delay, maxTools int, verbose bool, reportPath, runID string, prog Progress) error {
 	// Log run start
 	if _, err := db.Exec("INSERT INTO run_log (run_id, started_at, status) VALUES (?, ?, 'running')",
 		runID, time.Now().Format(time.RFC3339)); err != nil {
 		return fmt.Errorf("insert run log: %w", err)
 	}
 
-	fmt.Println("=== Pass 1: Discovery ===")
-	if err := runDiscovery(db, projectRoot); err != nil {
+	prog.PassHeader("Pass 1: Discovery")
+	if err := runDiscovery(db, projectRoot, prog); err != nil {
 		return updateRunStatus(db, runID, "failed", err)
 	}
 
-	fmt.Println("\n=== Pass 2: File Scan ===")
-	if err := runScan(db, projectRoot, model, delay, verbose); err != nil {
+	prog.PassHeader("Pass 2: File Scan")
+	if err := runScan(db, projectRoot, model, delay, verbose, prog); err != nil {
 		return updateRunStatus(db, runID, "failed", err)
 	}
 
-	fmt.Println("\n=== Pass 3: Relations ===")
-	if err := runRelations(db); err != nil {
+	prog.PassHeader("Pass 3: Relations")
+	if err := runRelations(db, prog); err != nil {
 		return updateRunStatus(db, runID, "failed", err)
 	}
 
-	fmt.Println("\n=== Pass 4: Structural Review ===")
-	if err := runStructural(db, projectRoot, model, maxTools, delay, verbose); err != nil {
+	prog.PassHeader("Pass 4: Structural Review")
+	if err := runStructural(db, projectRoot, model, maxTools, delay, verbose, prog); err != nil {
 		return updateRunStatus(db, runID, "failed", err)
 	}
 
-	fmt.Println("\n=== Pass 5: Report ===")
-	if err := runReport(db, model, reportPath, runID); err != nil {
+	prog.PassHeader("Pass 5: Report")
+	if err := runReport(db, model, reportPath, runID, prog); err != nil {
 		return updateRunStatus(db, runID, "failed", err)
 	}
 
 	// Log run completion
 	var filesScanned, findingsCount, filesTotal int
 	if err := db.QueryRow("SELECT COUNT(*) FROM files WHERE status = 'scanned'").Scan(&filesScanned); err != nil {
-		fmt.Printf("  warning: count scanned files: %v\n", err)
+		prog.Warn(fmt.Sprintf("count scanned files: %v", err))
 	}
 	if err := db.QueryRow("SELECT COUNT(*) FROM findings").Scan(&findingsCount); err != nil {
-		fmt.Printf("  warning: count findings: %v\n", err)
+		prog.Warn(fmt.Sprintf("count findings: %v", err))
 	}
 	if err := db.QueryRow("SELECT COUNT(*) FROM files").Scan(&filesTotal); err != nil {
-		fmt.Printf("  warning: count files: %v\n", err)
+		prog.Warn(fmt.Sprintf("count files: %v", err))
 	}
 
 	if _, err := db.Exec("UPDATE run_log SET finished_at = ?, files_total = ?, files_scanned = ?, findings_count = ?, status = 'completed' WHERE run_id = ?",
 		time.Now().Format(time.RFC3339), filesTotal, filesScanned, findingsCount, runID); err != nil {
-		fmt.Printf("  warning: update run log: %v\n", err)
+		prog.Warn(fmt.Sprintf("update run log: %v", err))
 	}
 
-	fmt.Println("\n=== Complete ===")
+	prog.PassComplete()
 	return nil
 }
 
@@ -216,12 +259,111 @@ func runStatus(db *sql.DB) error {
 	return nil
 }
 
+// runScanFile reviews a single file without touching the project database.
+// Useful for quick testing and debugging the scan pipeline.
+func runScanFile(filePath, model string, verbose bool, prog Progress) error {
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	ext := filepath.Ext(absPath)
+	lang := extensions[ext]
+	if lang == "" {
+		return fmt.Errorf("unsupported file extension: %s", ext)
+	}
+
+	tokenEstimate := len(content) / 4
+	prog.Info(fmt.Sprintf("File:     %s", filePath))
+	prog.Info(fmt.Sprintf("Language: %s", lang))
+	prog.Info(fmt.Sprintf("Tokens:   ~%d estimated", tokenEstimate))
+	prog.Info(fmt.Sprintf("Model:    %s", model))
+	prog.Info("")
+
+	if tokenEstimate > 30000 {
+		prog.Warn(fmt.Sprintf("File is very large (~%d tokens). This would be auto-skipped in a full run.", tokenEstimate))
+	}
+
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return fmt.Errorf("create ollama client: %w", err)
+	}
+
+	start := time.Now()
+	resp, truncated, err := callLLMForScan(client, model, filePath, lang, string(content), tokenEstimate, prog)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		return fmt.Errorf("LLM error: %w", err)
+	}
+
+	if truncated {
+		prog.Warn("[response truncated by token limit — attempting repair]")
+	}
+
+	parsed, err := parseScanResponse(resp)
+
+	if err != nil && truncated {
+		prog.Info("[repair failed — retrying with concise prompt]")
+		resp2, _, err2 := callLLMForScanConcise(client, model, filePath, lang, string(content), tokenEstimate, prog)
+		if err2 == nil {
+			if p, e := parseScanResponse(resp2); e == nil {
+				parsed = p
+				err = nil
+			}
+		}
+	}
+
+	if err != nil {
+		if verbose {
+			prog.Info(fmt.Sprintf("Raw response:\n%s", resp))
+		}
+		return fmt.Errorf("parse error: %w", err)
+	}
+
+	// Print results
+	prog.Info(fmt.Sprintf("\n=== Results (%s) ===", elapsed.Round(time.Millisecond)))
+	prog.Info(fmt.Sprintf("Issues found: %d", len(parsed.Issues)))
+	prog.Info(fmt.Sprintf("Summary: %s", parsed.Metadata.Summary))
+	prog.Info("")
+
+	if len(parsed.Issues) == 0 {
+		prog.Info("No issues found.")
+		return nil
+	}
+
+	for i, issue := range parsed.Issues {
+		lines := ""
+		if issue.LineStart != nil {
+			lines = fmt.Sprintf(" (L%d", *issue.LineStart)
+			if issue.LineEnd != nil && *issue.LineEnd != *issue.LineStart {
+				lines += fmt.Sprintf("–%d", *issue.LineEnd)
+			}
+			lines += ")"
+		}
+		prog.Info(fmt.Sprintf("[%d] [%s/%s] %s%s", i+1, issue.Severity, issue.Category, issue.Title, lines))
+		prog.Info(fmt.Sprintf("    %s", issue.Description))
+		if issue.Suggestion != "" {
+			prog.Info(fmt.Sprintf("    → %s", issue.Suggestion))
+		}
+		prog.Info("")
+	}
+
+	return nil
+}
+
 func printUsage() {
 	fmt.Println(`reviewbot <command> [project_root] [flags]
 
 Commands:
   discover      Pass 1 — scan filesystem, hash files, build work queue
   scan          Pass 2 — LLM review of each pending file (no tools)
+  scan-file     Review a single file (no DB, quick test)
   relations     Pass 3 — build dependency graph from extracted metadata
   structural    Pass 4 — cross-file analysis with tool calling
   report        Pass 5 — generate markdown report

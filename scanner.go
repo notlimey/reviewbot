@@ -14,11 +14,25 @@ import (
 )
 
 const (
-	llmTimeout     = 10 * time.Minute
-	scanNumPredict = 4096 // output limit per file — keeps responses concise
+	llmTimeout        = 10 * time.Minute
+	scanNumPredictMin = 4096  // output limit for small files
+	scanNumPredictMax = 16384 // output limit for large files
 )
 
-func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool) error {
+// scanNumPredict scales the output token budget based on estimated input size.
+// Larger files produce more findings & metadata and need more room to respond.
+func scanNumPredict(tokenEstimate int) int {
+	switch {
+	case tokenEstimate > 20000:
+		return scanNumPredictMax
+	case tokenEstimate > 8000:
+		return 8192
+	default:
+		return scanNumPredictMin
+	}
+}
+
+func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool, prog Progress) error {
 	absRoot, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return fmt.Errorf("resolve project root: %w", err)
@@ -41,11 +55,11 @@ func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool) err
 	}
 
 	if totalPending == 0 {
-		fmt.Println("No pending files to scan.")
+		prog.Info("No pending files to scan.")
 		return nil
 	}
 
-	fmt.Printf("Scanning %d pending files with model %s...\n", totalPending, model)
+	prog.ScanStart(totalPending, model)
 
 	rows, err := db.Query(
 		"SELECT id, path, language, token_estimate FROM files WHERE status = 'pending' ORDER BY token_estimate ASC",
@@ -72,56 +86,85 @@ func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool) err
 	for _, f := range files {
 		scanned++
 
-		// Skip very large files
-		if f.TokenEstimate > 50000 {
+		// Skip very large files.
+		// The prompt overhead is ~500 tokens, so the total context needed is
+		// roughly tokenEstimate + 500 (input) + num_predict (output). Most
+		// local models default to 8K–32K context; 30 000 input tokens is a
+		// safe upper bound that leaves room for the response.
+		if f.TokenEstimate > 30000 {
+			// Mark as skipped and auto-create a finding so the report
+			// surfaces the file instead of silently dropping it.
 			if _, err := db.Exec("UPDATE files SET status = 'skipped' WHERE id = ?", f.ID); err != nil {
-				fmt.Printf("    warning: db error: %v\n", err)
+				prog.Warn(fmt.Sprintf("db error: %v", err))
 			}
-			fmt.Printf("  ⊘ [%d/%d] %s (skipped — too large: ~%d tokens)\n", scanned, totalPending, f.Path, f.TokenEstimate)
+			_, _ = db.Exec(
+				`INSERT INTO findings (file_id, pass, category, severity, confidence, title, description, line_start, line_end, suggestion)
+				 VALUES (?, 'file_scan', 'style', 'medium', 1.0,
+				         'File too large for automated review',
+				         ?, NULL, NULL,
+				         'Consider splitting this file into smaller, focused modules.')`,
+				f.ID,
+				fmt.Sprintf("At ~%d estimated tokens this file exceeds the review limit. Large files are harder to reason about and often indicate that the module has too many responsibilities.", f.TokenEstimate),
+			)
+			prog.ScanFileSkipped(scanned, totalPending, f.Path, fmt.Sprintf("too large: ~%d tokens (finding created)", f.TokenEstimate))
 			continue
 		}
 
 		// Set status to scanning
 		if _, err := db.Exec("UPDATE files SET status = 'scanning' WHERE id = ?", f.ID); err != nil {
-			fmt.Printf("    warning: db error: %v\n", err)
+			prog.Warn(fmt.Sprintf("db error: %v", err))
 		}
 
 		// Read file content
 		content, err := os.ReadFile(filepath.Join(absRoot, f.Path))
 		if err != nil {
-			fmt.Printf("  ✗ [%d/%d] %s (read error: %v)\n", scanned, totalPending, f.Path, err)
+			prog.ScanFileError(scanned, totalPending, f.Path, fmt.Sprintf("read error: %v", err))
 			if _, execErr := db.Exec("UPDATE files SET status = 'error' WHERE id = ?", f.ID); execErr != nil {
-				fmt.Printf("    warning: update status: %v\n", execErr)
+				prog.Warn(fmt.Sprintf("update status: %v", execErr))
 			}
 			continue
 		}
 
-		fmt.Printf("  … [%d/%d] %s (~%d tokens, %s)\n", scanned, totalPending, f.Path, f.TokenEstimate, f.Language)
+		prog.ScanFileStart(scanned, totalPending, f.Path, f.TokenEstimate, f.Language)
 
 		start := time.Now()
-		resp, truncated, err := callLLMForScan(client, model, f.Path, f.Language, string(content))
+		resp, truncated, err := callLLMForScan(client, model, f.Path, f.Language, string(content), f.TokenEstimate, prog)
 		elapsed := time.Since(start)
 
 		if err != nil {
-			fmt.Printf("  ✗ [%d/%d] %s (LLM error: %v)\n", scanned, totalPending, f.Path, err)
+			prog.ScanFileError(scanned, totalPending, f.Path, fmt.Sprintf("LLM error: %v", err))
 			if _, execErr := db.Exec("UPDATE files SET status = 'pending' WHERE id = ?", f.ID); execErr != nil {
-				fmt.Printf("    warning: update status: %v\n", execErr)
+				prog.Warn(fmt.Sprintf("update status: %v", execErr))
 			}
 			continue
 		}
 
 		if truncated {
-			fmt.Printf("    [truncated by token limit — attempting repair]\n")
+			prog.Info("    [truncated by token limit — attempting repair]")
 		}
 
 		parsed, err := parseScanResponse(resp)
+
+		// If the response was truncated and repair failed, retry once with a
+		// more aggressive conciseness instruction and a larger output budget.
+		if err != nil && truncated {
+			prog.Info("    [repair failed — retrying with concise prompt]")
+			resp2, _, err2 := callLLMForScanConcise(client, model, f.Path, f.Language, string(content), f.TokenEstimate, prog)
+			if err2 == nil {
+				if p, e := parseScanResponse(resp2); e == nil {
+					parsed = p
+					err = nil
+				}
+			}
+		}
+
 		if err != nil {
-			fmt.Printf("  ✗ [%d/%d] %s (parse error: %v)\n", scanned, totalPending, f.Path, err)
+			prog.ScanFileError(scanned, totalPending, f.Path, fmt.Sprintf("parse error: %v", err))
 			if verbose {
-				fmt.Printf("    raw response: %s\n", resp)
+				prog.Info(fmt.Sprintf("    raw response: %s", resp))
 			}
 			if _, execErr := db.Exec("UPDATE files SET status = 'error' WHERE id = ?", f.ID); execErr != nil {
-				fmt.Printf("    warning: update status: %v\n", execErr)
+				prog.Warn(fmt.Sprintf("update status: %v", execErr))
 			}
 			continue
 		}
@@ -129,21 +172,21 @@ func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool) err
 		// Save findings + metadata + status in a transaction to avoid duplicates on crash
 		issueCount, err := saveScanResults(db, f.ID, parsed)
 		if err != nil {
-			fmt.Printf("  ✗ [%d/%d] %s (db error: %v)\n", scanned, totalPending, f.Path, err)
+			prog.ScanFileError(scanned, totalPending, f.Path, fmt.Sprintf("db error: %v", err))
 			if _, execErr := db.Exec("UPDATE files SET status = 'error' WHERE id = ?", f.ID); execErr != nil {
-				fmt.Printf("    warning: update status: %v\n", execErr)
+				prog.Warn(fmt.Sprintf("update status: %v", execErr))
 			}
 			continue
 		}
 
-		fmt.Printf("  ✓ [%d/%d] %s (%d issues, %s)\n", scanned, totalPending, f.Path, issueCount, elapsed.Round(time.Second))
+		prog.ScanFileDone(scanned, totalPending, f.Path, issueCount, elapsed)
 
 		if delay > 0 && scanned < len(files) {
 			time.Sleep(time.Duration(delay) * time.Second)
 		}
 	}
 
-	fmt.Printf("Scan complete: %d files processed\n", scanned)
+	prog.ScanComplete(scanned)
 	return nil
 }
 
@@ -204,7 +247,7 @@ func saveScanResults(db *sql.DB, fileID int64, parsed *ScanResponse) (int, error
 
 // callLLMForScan sends a file to the LLM for review and returns the raw
 // response, whether it was truncated, and any error.
-func callLLMForScan(client *api.Client, model, path, language, content string) (string, bool, error) {
+func callLLMForScan(client *api.Client, model, path, language, content string, tokenEstimate int, prog Progress) (string, bool, error) {
 	prompt := fmt.Sprintf(`Review this %s file. Report ONLY real bugs, security issues, or performance problems. Skip style nits.
 
 IMPORTANT: Be extremely concise. Each field value should be 1-2 sentences max. Do NOT repeat code. Do NOT explain obvious things. The entire response must be compact JSON.
@@ -217,6 +260,14 @@ If no issues: {"issues":[],"metadata":{"exports":[],"imports":[],"interfaces":[]
 File: %s
 `+"```%s\n%s\n```", language, path, language, content)
 
+	// Request a context window large enough for input + output + safety margin.
+	// Ollama defaults to a small context (often 2048–4096) unless told otherwise.
+	numPredict := scanNumPredict(tokenEstimate)
+	numCtx := tokenEstimate + numPredict + 1024 // input + output + overhead
+	if numCtx < 8192 {
+		numCtx = 8192
+	}
+
 	stream := true
 	req := &api.ChatRequest{
 		Model:    model,
@@ -225,7 +276,8 @@ File: %s
 		Format:   json.RawMessage(`"json"`),
 		Options: map[string]any{
 			"temperature": 0.3,
-			"num_predict": scanNumPredict,
+			"num_predict": numPredict,
+			"num_ctx":     numCtx,
 		},
 	}
 
@@ -243,7 +295,7 @@ File: %s
 				response.WriteString(resp.Message.Content)
 				tokenCount++
 				if tokenCount%10 == 0 {
-					fmt.Printf("\r    … generating: %d tokens", tokenCount)
+					prog.Tokens("generating", tokenCount)
 				}
 			}
 			if resp.Done && resp.DoneReason == "length" {
@@ -254,20 +306,80 @@ File: %s
 		cancel()
 
 		if lastErr == nil {
-			fmt.Printf("\r    … generated %d tokens            \n", tokenCount)
+			prog.TokensDone("generating", tokenCount)
 			return response.String(), truncated, nil
 		}
-		fmt.Printf("\n    retry %d/3 for %s: %v\n", attempt+1, path, lastErr)
+		prog.Info(fmt.Sprintf("\n    retry %d/3 for %s: %v", attempt+1, path, lastErr))
 		time.Sleep(5 * time.Second)
 	}
 
 	return "", false, fmt.Errorf("after 3 retries: %w", lastErr)
 }
 
+// callLLMForScanConcise is a retry variant that asks the LLM to report only
+// critical/high issues and uses a larger output budget. Called when the first
+// attempt was truncated and JSON repair failed.
+func callLLMForScanConcise(client *api.Client, model, path, language, content string, tokenEstimate int, prog Progress) (string, bool, error) {
+	prompt := fmt.Sprintf(`Review this %s file. Report ONLY critical and high severity bugs or security issues. Skip everything else.
+
+CRITICAL: Keep your response as SHORT as possible. One sentence per field. Limit to at most 5 issues.
+
+Return ONLY this JSON:
+{"issues":[{"category":"bug|security|perf","severity":"critical|high","confidence":0.0-1.0,"title":"short","description":"brief","line_start":null,"line_end":null,"suggestion":"brief"}],"metadata":{"exports":[],"imports":[],"interfaces":[],"patterns":[],"summary":"one sentence"}}
+
+File: %s
+`+"```%s\n%s\n```", language, path, language, content)
+
+	numPredict := scanNumPredictMax
+	numCtx := tokenEstimate + numPredict + 1024
+	if numCtx < 8192 {
+		numCtx = 8192
+	}
+
+	stream := true
+	req := &api.ChatRequest{
+		Model:    model,
+		Messages: []api.Message{{Role: "user", Content: prompt}},
+		Stream:   &stream,
+		Format:   json.RawMessage(`"json"`),
+		Options: map[string]any{
+			"temperature": 0.2,
+			"num_predict": numPredict,
+			"num_ctx":     numCtx,
+		},
+	}
+
+	var response strings.Builder
+	tokenCount := 0
+	truncated := false
+
+	ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
+	err := client.Chat(ctx, req, func(resp api.ChatResponse) error {
+		if resp.Message.Content != "" {
+			response.WriteString(resp.Message.Content)
+			tokenCount++
+			if tokenCount%10 == 0 {
+				prog.Tokens("retry", tokenCount)
+			}
+		}
+		if resp.Done && resp.DoneReason == "length" {
+			truncated = true
+		}
+		return nil
+	})
+	cancel()
+
+	if err != nil {
+		return "", false, err
+	}
+	prog.TokensDone("retry", tokenCount)
+	return response.String(), truncated, nil
+}
+
 // streamLLMChat streams an LLM chat request with a live token counter.
 // Returns the final ChatResponse (for tool calls), the accumulated text,
 // whether it was truncated, and any error.
-func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.ChatResponse, string, bool, error) {
+func streamLLMChat(client *api.Client, req *api.ChatRequest, label string, prog Progress) (api.ChatResponse, string, bool, error) {
 	stream := true
 	req.Stream = &stream
 
@@ -283,7 +395,7 @@ func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.
 			response.WriteString(r.Message.Content)
 			tokenCount++
 			if tokenCount%10 == 0 {
-				fmt.Printf("\r    … %s: %d tokens", label, tokenCount)
+				prog.Tokens(label, tokenCount)
 			}
 		}
 		if r.Done && r.DoneReason == "length" {
@@ -294,7 +406,7 @@ func streamLLMChat(client *api.Client, req *api.ChatRequest, label string) (api.
 	cancel()
 
 	if tokenCount > 0 {
-		fmt.Printf("\r    … %s: %d tokens            \n", label, tokenCount)
+		prog.TokensDone(label, tokenCount)
 	}
 
 	finalResp.Message.Content = response.String()
