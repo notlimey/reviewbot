@@ -66,6 +66,8 @@ func renderDashboard(m model) string {
 	b.WriteString(valueStyle.Render(m.model))
 	b.WriteString(mutedStyle.Render("  DB: "))
 	b.WriteString(valueStyle.Render(m.dbPath))
+	b.WriteString(mutedStyle.Render("  Delay: "))
+	b.WriteString(valueStyle.Render(fmt.Sprintf("%ds", m.delay)))
 	b.WriteString("\n\n")
 
 	// File stats
@@ -166,6 +168,7 @@ func renderCommands(running bool) string {
 	b.WriteString(keyStyle.Render("[a]") + mutedStyle.Render(" run all  "))
 	b.WriteString(keyStyle.Render("[f]") + mutedStyle.Render(" findings  "))
 	b.WriteString(keyStyle.Render("[x]") + mutedStyle.Render(" reset  "))
+	b.WriteString(keyStyle.Render("[+/-]") + mutedStyle.Render(" delay  "))
 	b.WriteString(keyStyle.Render("[q]") + mutedStyle.Render(" quit  "))
 	b.WriteString(keyStyle.Render("[?]") + mutedStyle.Render(" help"))
 	return b.String()

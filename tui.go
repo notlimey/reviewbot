@@ -255,6 +255,14 @@ func (m model) handleDashboardKey(key string) (tea.Model, tea.Cmd) {
 		return m, m.startPass("Full Pipeline", func(prog Progress) error {
 			return runAll(m.db, m.projectRoot, m.model, m.delay, m.maxTools, m.verbose, m.reportPath, runID, prog)
 		})
+	case "+", "=":
+		m.delay++
+		return m, nil
+	case "-":
+		if m.delay > 0 {
+			m.delay--
+		}
+		return m, nil
 	case "f":
 		m.findings = fetchFindings(m.db, "")
 		m.findingIdx = 0
@@ -322,6 +330,7 @@ func renderHelp() string {
 	help += "  " + keyStyle.Render("a") + mutedStyle.Render("  Run all passes (full pipeline)") + "\n"
 	help += "  " + keyStyle.Render("f") + mutedStyle.Render("  Browse findings") + "\n"
 	help += "  " + keyStyle.Render("x") + mutedStyle.Render("  Reset database") + "\n"
+	help += "  " + keyStyle.Render("+/-") + mutedStyle.Render("  Adjust delay between files") + "\n"
 	help += "\n"
 	help += valueStyle.Render("Findings Browser") + "\n"
 	help += "  " + keyStyle.Render("j/k") + mutedStyle.Render("    Navigate up/down") + "\n"
