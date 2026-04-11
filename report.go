@@ -45,6 +45,15 @@ func deduplicateFindings(db *sql.DB) (int, error) {
 	return len(ids), nil
 }
 
+// copyFile copies src to dst, preserving content.
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0644)
+}
+
 func runReport(db *sql.DB, model, reportPath, runID string, prog Progress) error {
 	// Deduplicate near-identical findings before generating the report
 	if removed, err := deduplicateFindings(db); err != nil {
@@ -222,6 +231,16 @@ func runReport(db *sql.DB, model, reportPath, runID string, prog Progress) error
 
 	if mediumCount+lowCount == 0 {
 		b.WriteString("No medium or low severity findings.\n")
+	}
+
+	// Back up existing report before overwriting
+	if _, err := os.Stat(reportPath); err == nil {
+		backupPath := strings.TrimSuffix(reportPath, ".md") + "_" + runID + ".md"
+		if copyErr := copyFile(reportPath, backupPath); copyErr != nil {
+			prog.Warn(fmt.Sprintf("backup report: %v", copyErr))
+		} else {
+			prog.Info(fmt.Sprintf("Previous report backed up to %s", backupPath))
+		}
 	}
 
 	// Write to file

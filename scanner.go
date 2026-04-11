@@ -957,8 +957,35 @@ var hedgeWords = []string{
 	"not guaranteed", "depending on", "in theory",
 }
 
+// falsePositivePatterns are phrases that indicate confidently wrong findings —
+// the model believes these are real issues but they stem from fundamental
+// misunderstandings (e.g., Go package visibility, reading function signatures).
+var falsePositivePatterns = []string{
+	// Go package visibility: model thinks unexported = inaccessible from tests
+	"unexported function",
+	"unexported method",
+	"not visible in this test",
+	"not accessible to this test",
+	"not defined in the provided file",
+	"not defined in this file",
+	"relies on unexported",
+	// Flag/parameter confusion: model misreads which variable is passed
+	"passes the flag value string instead of",
+	"flag value string instead of the actual",
+	"instead of the actual *sql.db",
+	"instead of the actual database",
+	"receives an incorrect type or value",
+}
+
 func keepFinding(issue ScanIssue) bool {
 	desc := strings.ToLower(issue.Description + " " + issue.Title)
+
+	// Drop findings matching known false positive patterns
+	for _, p := range falsePositivePatterns {
+		if strings.Contains(desc, p) {
+			return false
+		}
+	}
 
 	// Count hedging phrases
 	hedges := 0
