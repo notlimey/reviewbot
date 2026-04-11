@@ -26,15 +26,23 @@ type dashboardStats struct {
 func fetchDashboardStats(db *sql.DB) dashboardStats {
 	var s dashboardStats
 
-	db.QueryRow("SELECT COUNT(*) FROM files").Scan(&s.filesTotal)
-	db.QueryRow("SELECT COUNT(*) FROM files WHERE status = 'pending'").Scan(&s.filesPending)
-	db.QueryRow("SELECT COUNT(*) FROM files WHERE status = 'scanned'").Scan(&s.filesScanned)
-	db.QueryRow("SELECT COUNT(*) FROM files WHERE status = 'error'").Scan(&s.filesError)
-	db.QueryRow("SELECT COUNT(*) FROM files WHERE status = 'skipped'").Scan(&s.filesSkipped)
-	db.QueryRow("SELECT COUNT(*) FROM findings WHERE severity = 'critical'").Scan(&s.critical)
-	db.QueryRow("SELECT COUNT(*) FROM findings WHERE severity = 'high'").Scan(&s.high)
-	db.QueryRow("SELECT COUNT(*) FROM findings WHERE severity = 'medium'").Scan(&s.medium)
-	db.QueryRow("SELECT COUNT(*) FROM findings WHERE severity = 'low'").Scan(&s.low)
+	// File counts in a single query using conditional aggregation
+	db.QueryRow(`SELECT
+		COUNT(*),
+		COUNT(CASE WHEN status = 'pending' THEN 1 END),
+		COUNT(CASE WHEN status = 'scanned' THEN 1 END),
+		COUNT(CASE WHEN status = 'error' THEN 1 END),
+		COUNT(CASE WHEN status = 'skipped' THEN 1 END)
+		FROM files`).Scan(&s.filesTotal, &s.filesPending, &s.filesScanned, &s.filesError, &s.filesSkipped)
+
+	// Finding counts in a single query
+	db.QueryRow(`SELECT
+		COUNT(CASE WHEN severity = 'critical' THEN 1 END),
+		COUNT(CASE WHEN severity = 'high' THEN 1 END),
+		COUNT(CASE WHEN severity = 'medium' THEN 1 END),
+		COUNT(CASE WHEN severity = 'low' THEN 1 END)
+		FROM findings`).Scan(&s.critical, &s.high, &s.medium, &s.low)
+
 	db.QueryRow("SELECT COUNT(*) FROM structural_findings").Scan(&s.structural)
 	db.QueryRow("SELECT COUNT(*) FROM relations").Scan(&s.relations)
 	db.QueryRow("SELECT run_id, status FROM run_log ORDER BY id DESC LIMIT 1").Scan(&s.lastRunID, &s.lastRunStatus)

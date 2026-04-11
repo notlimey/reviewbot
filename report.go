@@ -8,7 +8,51 @@ import (
 	"time"
 )
 
+// deduplicateFindings removes near-duplicate findings for the same file and
+// category, keeping the one with the highest confidence. Two findings are
+// considered duplicates when they share the same file_id, category, and their
+// titles share a long common prefix (first 40 chars after lowercasing).
+func deduplicateFindings(db *sql.DB) (int, error) {
+	rows, err := db.Query(`
+		SELECT fi1.id
+		FROM findings fi1
+		JOIN findings fi2 ON fi1.file_id = fi2.file_id
+			AND fi1.category = fi2.category
+			AND fi1.id > fi2.id
+			AND SUBSTR(LOWER(fi1.title), 1, 40) = SUBSTR(LOWER(fi2.title), 1, 40)
+		WHERE fi1.confidence <= fi2.confidence
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, id := range ids {
+		db.Exec("DELETE FROM findings WHERE id = ?", id)
+	}
+	return len(ids), nil
+}
+
 func runReport(db *sql.DB, model, reportPath, runID string, prog Progress) error {
+	// Deduplicate near-identical findings before generating the report
+	if removed, err := deduplicateFindings(db); err != nil {
+		prog.Warn(fmt.Sprintf("deduplication: %v", err))
+	} else if removed > 0 {
+		prog.Info(fmt.Sprintf("Deduplicated %d near-duplicate findings", removed))
+	}
+
 	var b strings.Builder
 
 	// Header

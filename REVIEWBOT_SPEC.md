@@ -62,7 +62,7 @@ Commands:
   reset         Drop all tables and start fresh
 
 Flags:
-  -model        string   Ollama model name (default: "gemma4:26b")
+  -model        string   Ollama model name (default: "gemma4:e4b")
   -db           string   SQLite database path (default: "review.db")
   -delay        int      Seconds between LLM calls for thermal management (default: 2)
   -report       string   Output report path (default: "review_report.md")
@@ -525,7 +525,7 @@ No LLM involved. Pure SQL queries and string formatting.
 ```markdown
 # Code Review Report
 Generated: 2026-04-09 08:30
-Model: gemma4:26b | Run ID: 20260409-230000
+Model: gemma4:e4b | Run ID: 20260409-230000
 
 ## Summary
 | Metric           | Count |
@@ -687,7 +687,7 @@ messages = append(messages, api.Message{
 
 ## 16. Performance Expectations
 
-On MacBook Pro M4 Pro, 48GB, running gemma4:26b at Q4:
+On MacBook Pro M4 Pro, 48GB, running gemma4:e4b at Q4:
 
 | Metric                    | Estimate          |
 |---------------------------|-------------------|
@@ -757,7 +757,7 @@ These are explicitly out of scope for the first build. Note them in the README b
 
 6. **The model may return empty issues arrays** — this is valid. Not every file has problems.
 
-7. **Keep prompts under the model's context window** — gemma4:26b has 256K context but practically you want to stay under 32K per call for speed. Skip files that would exceed this.
+7. **Keep prompts under the model's context window** — gemma4:e4b has 256K context but practically you want to stay under 32K per call for speed. Skip files that would exceed this.
 
 8. **`Stream: &falseVar`** — the Ollama Go SDK requires a pointer to bool for the stream field. Create `var falseBool = false` and pass `&falseBool`.
 

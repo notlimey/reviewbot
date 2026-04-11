@@ -85,101 +85,33 @@ func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool, pro
 	scanned := 0
 	for _, f := range files {
 		scanned++
+		result := scanFile(scanFileInput{
+			db:            db,
+			client:        client,
+			absRoot:       absRoot,
+			model:         model,
+			file:          f,
+			n:             scanned,
+			total:         totalPending,
+			verbose:       verbose,
+			prog:          prog,
+		})
 
-		// Skip very large files.
-		// The prompt overhead is ~500 tokens, so the total context needed is
-		// roughly tokenEstimate + 500 (input) + num_predict (output). Most
-		// local models default to 8K–32K context; 30 000 input tokens is a
-		// safe upper bound that leaves room for the response.
-		if f.TokenEstimate > 30000 {
-			// Mark as skipped and auto-create a finding so the report
-			// surfaces the file instead of silently dropping it.
-			if _, err := db.Exec("UPDATE files SET status = 'skipped' WHERE id = ?", f.ID); err != nil {
-				prog.Warn(fmt.Sprintf("db error: %v", err))
-			}
-			_, _ = db.Exec(
-				`INSERT INTO findings (file_id, pass, category, severity, confidence, title, description, line_start, line_end, suggestion)
-				 VALUES (?, 'file_scan', 'style', 'medium', 1.0,
-				         'File too large for automated review',
-				         ?, NULL, NULL,
-				         'Consider splitting this file into smaller, focused modules.')`,
-				f.ID,
-				fmt.Sprintf("At ~%d estimated tokens this file exceeds the review limit. Large files are harder to reason about and often indicate that the module has too many responsibilities.", f.TokenEstimate),
-			)
-			prog.ScanFileSkipped(scanned, totalPending, f.Path, fmt.Sprintf("too large: ~%d tokens (finding created)", f.TokenEstimate))
-			continue
-		}
-
-		// Set status to scanning
-		if _, err := db.Exec("UPDATE files SET status = 'scanning' WHERE id = ?", f.ID); err != nil {
-			prog.Warn(fmt.Sprintf("db error: %v", err))
-		}
-
-		// Read file content
-		content, err := os.ReadFile(filepath.Join(absRoot, f.Path))
-		if err != nil {
-			prog.ScanFileError(scanned, totalPending, f.Path, fmt.Sprintf("read error: %v", err))
-			if _, execErr := db.Exec("UPDATE files SET status = 'error' WHERE id = ?", f.ID); execErr != nil {
-				prog.Warn(fmt.Sprintf("update status: %v", execErr))
-			}
-			continue
-		}
-
-		prog.ScanFileStart(scanned, totalPending, f.Path, f.TokenEstimate, f.Language)
-
-		start := time.Now()
-		resp, truncated, err := callLLMForScan(client, model, f.Path, f.Language, string(content), f.TokenEstimate, prog)
-		elapsed := time.Since(start)
-
-		if err != nil {
-			prog.ScanFileError(scanned, totalPending, f.Path, fmt.Sprintf("LLM error: %v", err))
+		switch result.status {
+		case scanSkipped:
+			// already handled inside scanFile
+		case scanRetryLater:
+			// LLM connection error — leave as pending for next run
 			if _, execErr := db.Exec("UPDATE files SET status = 'pending' WHERE id = ?", f.ID); execErr != nil {
 				prog.Warn(fmt.Sprintf("update status: %v", execErr))
 			}
-			continue
-		}
-
-		if truncated {
-			prog.Info("    [truncated by token limit — attempting repair]")
-		}
-
-		parsed, err := parseScanResponse(resp)
-
-		// If the response was truncated and repair failed, retry once with a
-		// more aggressive conciseness instruction and a larger output budget.
-		if err != nil && truncated {
-			prog.Info("    [repair failed — retrying with concise prompt]")
-			resp2, _, err2 := callLLMForScanConcise(client, model, f.Path, f.Language, string(content), f.TokenEstimate, prog)
-			if err2 == nil {
-				if p, e := parseScanResponse(resp2); e == nil {
-					parsed = p
-					err = nil
-				}
-			}
-		}
-
-		if err != nil {
-			prog.ScanFileError(scanned, totalPending, f.Path, fmt.Sprintf("parse error: %v", err))
-			if verbose {
-				prog.Info(fmt.Sprintf("    raw response: %s", resp))
-			}
+		case scanError:
 			if _, execErr := db.Exec("UPDATE files SET status = 'error' WHERE id = ?", f.ID); execErr != nil {
 				prog.Warn(fmt.Sprintf("update status: %v", execErr))
 			}
-			continue
+		case scanOK:
+			prog.ScanFileDone(scanned, totalPending, f.Path, result.issueCount, result.elapsed)
 		}
-
-		// Save findings + metadata + status in a transaction to avoid duplicates on crash
-		issueCount, err := saveScanResults(db, f.ID, parsed)
-		if err != nil {
-			prog.ScanFileError(scanned, totalPending, f.Path, fmt.Sprintf("db error: %v", err))
-			if _, execErr := db.Exec("UPDATE files SET status = 'error' WHERE id = ?", f.ID); execErr != nil {
-				prog.Warn(fmt.Sprintf("update status: %v", execErr))
-			}
-			continue
-		}
-
-		prog.ScanFileDone(scanned, totalPending, f.Path, issueCount, elapsed)
 
 		if delay > 0 && scanned < len(files) {
 			time.Sleep(time.Duration(delay) * time.Second)
@@ -188,6 +120,111 @@ func runScan(db *sql.DB, projectRoot, model string, delay int, verbose bool, pro
 
 	prog.ScanComplete(scanned)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Per-file scan pipeline: pre-hook → LLM call → post-hook (recover + filter)
+// ---------------------------------------------------------------------------
+
+type scanStatus int
+
+const (
+	scanOK         scanStatus = iota
+	scanSkipped               // file too large, already handled
+	scanRetryLater            // LLM unavailable, leave as pending
+	scanError                 // parse/db error, mark as error
+)
+
+type scanFileInput struct {
+	db      *sql.DB
+	client  *api.Client
+	absRoot string
+	model   string
+	file    FileRecord
+	n       int
+	total   int
+	verbose bool
+	prog    Progress
+}
+
+type scanFileResult struct {
+	status     scanStatus
+	issueCount int
+	elapsed    time.Duration
+}
+
+// scanFile runs the full pre-hook → LLM → post-hook pipeline for one file.
+func scanFile(in scanFileInput) scanFileResult {
+	f := in.file
+
+	// ── Pre-hook: validate inputs ──────────────────────────────────────
+	if f.TokenEstimate > 30000 {
+		if _, err := in.db.Exec("UPDATE files SET status = 'skipped' WHERE id = ?", f.ID); err != nil {
+			in.prog.Warn(fmt.Sprintf("db error: %v", err))
+		}
+		_, _ = in.db.Exec(
+			`INSERT INTO findings (file_id, pass, category, severity, confidence, title, description, line_start, line_end, suggestion)
+			 VALUES (?, 'file_scan', 'style', 'medium', 1.0,
+			         'File too large for automated review',
+			         ?, NULL, NULL,
+			         'Consider splitting this file into smaller, focused modules.')`,
+			f.ID,
+			fmt.Sprintf("At ~%d estimated tokens this file exceeds the review limit. Large files are harder to reason about and often indicate that the module has too many responsibilities.", f.TokenEstimate),
+		)
+		in.prog.ScanFileSkipped(in.n, in.total, f.Path, fmt.Sprintf("too large: ~%d tokens (finding created)", f.TokenEstimate))
+		return scanFileResult{status: scanSkipped}
+	}
+
+	if _, err := in.db.Exec("UPDATE files SET status = 'scanning' WHERE id = ?", f.ID); err != nil {
+		in.prog.Warn(fmt.Sprintf("db error: %v", err))
+	}
+
+	content, err := os.ReadFile(filepath.Join(in.absRoot, f.Path))
+	if err != nil {
+		in.prog.ScanFileError(in.n, in.total, f.Path, fmt.Sprintf("read error: %v", err))
+		return scanFileResult{status: scanError}
+	}
+
+	in.prog.ScanFileStart(in.n, in.total, f.Path, f.TokenEstimate, f.Language)
+
+	// ── LLM call ───────────────────────────────────────────────────────
+	start := time.Now()
+	resp, truncated, err := callLLMForScan(in.client, in.model, f.Path, f.Language, string(content), f.TokenEstimate, in.prog)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		in.prog.ScanFileError(in.n, in.total, f.Path, fmt.Sprintf("LLM error: %v", err))
+		return scanFileResult{status: scanRetryLater}
+	}
+
+	// ── Post-hook: recover, filter, save ───────────────────────────────
+	parsed, err := recoverScanResponse(recoverCtx{
+		client:        in.client,
+		model:         in.model,
+		path:          f.Path,
+		language:      f.Language,
+		content:       string(content),
+		tokenEstimate: f.TokenEstimate,
+		rawResp:       resp,
+		truncated:     truncated,
+		verbose:       in.verbose,
+		prog:          in.prog,
+	})
+	if err != nil {
+		in.prog.ScanFileError(in.n, in.total, f.Path, fmt.Sprintf("parse error: %v", err))
+		if in.verbose {
+			in.prog.Info(fmt.Sprintf("    raw response: %s", resp))
+		}
+		return scanFileResult{status: scanError}
+	}
+
+	issueCount, err := saveScanResults(in.db, f.ID, parsed)
+	if err != nil {
+		in.prog.ScanFileError(in.n, in.total, f.Path, fmt.Sprintf("db error: %v", err))
+		return scanFileResult{status: scanError}
+	}
+
+	return scanFileResult{status: scanOK, issueCount: issueCount, elapsed: elapsed}
 }
 
 func saveScanResults(db *sql.DB, fileID int64, parsed *ScanResponse) (int, error) {
@@ -245,20 +282,114 @@ func saveScanResults(db *sql.DB, fileID int64, parsed *ScanResponse) (int, error
 	return issueCount, nil
 }
 
-// callLLMForScan sends a file to the LLM for review and returns the raw
-// response, whether it was truncated, and any error.
-func callLLMForScan(client *api.Client, model, path, language, content string, tokenEstimate int, prog Progress) (string, bool, error) {
-	prompt := fmt.Sprintf(`Review this %s file. Report ONLY real bugs, security issues, or performance problems. Skip style nits.
+// ---------------------------------------------------------------------------
+// Recovery pipeline
+// ---------------------------------------------------------------------------
+//
+// When the LLM returns malformed output, we run a sequence of increasingly
+// aggressive recovery steps. Each step is tried in order; the first one that
+// produces a valid *ScanResponse wins.
+//
+//   Step 1: parseScanResponse (direct parse → newline fix → truncation repair
+//           → newline+repair → partial extraction)
+//   Step 2: if truncated, re-prompt with concise system prompt + larger budget
+//   Step 3: give up and return the parse error
 
-IMPORTANT: Be extremely concise. Each field value should be 1-2 sentences max. Do NOT repeat code. Do NOT explain obvious things. The entire response must be compact JSON.
+// recoverCtx carries everything needed by the recovery pipeline so we don't
+// have to thread a dozen parameters through each step.
+type recoverCtx struct {
+	client        *api.Client
+	model         string
+	path          string
+	language      string
+	content       string
+	tokenEstimate int
+	rawResp       string
+	truncated     bool
+	verbose       bool
+	prog          Progress
+}
+
+// recoverScanResponse runs the recovery pipeline and returns a post-filtered
+// *ScanResponse or an error if all steps fail.
+func recoverScanResponse(rc recoverCtx) (*ScanResponse, error) {
+	if rc.truncated {
+		rc.prog.Info("    [step 1] truncated response — attempting parse + repair")
+	}
+
+	// Step 1: multi-strategy parse (5 sub-strategies inside parseScanResponse)
+	parsed, err := parseScanResponse(rc.rawResp)
+	if err == nil {
+		return postFilter(parsed, rc.prog), nil
+	}
+
+	// Step 2: if truncated, retry with concise prompt
+	if rc.truncated {
+		rc.prog.Info("    [step 2] repair failed — retrying with concise prompt")
+		resp2, _, err2 := callLLMForScanConcise(
+			rc.client, rc.model, rc.path, rc.language,
+			rc.content, rc.tokenEstimate, rc.prog,
+		)
+		if err2 == nil {
+			if p, e := parseScanResponse(resp2); e == nil {
+				return postFilter(p, rc.prog), nil
+			}
+		}
+	}
+
+	// Step 3: all recovery failed
+	return nil, fmt.Errorf("all recovery steps failed: %w", err)
+}
+
+// postFilter applies the finding filter and logs how many were removed.
+func postFilter(parsed *ScanResponse, prog Progress) *ScanResponse {
+	before := len(parsed.Issues)
+	parsed.Issues = filterFindings(parsed.Issues)
+	if filtered := before - len(parsed.Issues); filtered > 0 {
+		prog.Info(fmt.Sprintf("    filtered %d low-signal findings", filtered))
+	}
+	return parsed
+}
+
+// scanSystemPrompt is the static portion of the review prompt. It defines the
+// role, rules, and output format. Separated from per-file content so that
+// Ollama can cache the KV state for this prefix across files.
+const scanSystemPrompt = `You are a senior code reviewer. Report ONLY real bugs, security issues, or performance problems. Skip style nits.
+
+Be extremely concise. Each field value should be 1-2 sentences max. Do NOT repeat code. Do NOT explain obvious things. The entire response must be compact JSON.
+
+CONFIDENCE GUIDELINES — be honest about certainty:
+- 0.9-1.0: You can see the bug directly in this file with no ambiguity (e.g. null deref, SQL injection, off-by-one)
+- 0.7-0.8: Very likely an issue but depends on how callers use this code or on runtime conditions
+- 0.5-0.6: Possible issue that depends on context outside this file (other files, configuration, etc.)
+- Below 0.5: Do not report — if you are not reasonably confident, omit the finding entirely
+
+DO NOT REPORT any of these — they are NOT bugs:
+- SQL queries using parameterized placeholders (? or $1) are NOT SQL injection, even with LIKE
+- Functions called from test files that exist in the same package/module — tests can access all same-package symbols
+- Nil pointer risks where a nil check already guards the access on the same or preceding line
+- Division by zero where the divisor is already checked (e.g. if x > 0 before x used as divisor)
+- Approximate calculations that are clearly labeled as estimates (e.g. token estimation)
+- Default/fallback return values in parser helpers — returning a default for unparseable input is intentional
+- Standard resource cleanup patterns (e.g. defer rows.Close() after a query)
+- Hardcoded constants used in SQL DDL (e.g. DROP TABLE with a fixed table name list)
+
+LINE NUMBERS: The code has line numbers. Use them in line_start/line_end. Only report a line range if you can point to the exact lines.
 
 Return ONLY this JSON structure:
 {"issues":[{"category":"bug|security|perf|style","severity":"critical|high|medium|low","confidence":0.0-1.0,"title":"short title","description":"what is wrong","line_start":null,"line_end":null,"suggestion":"how to fix"}],"metadata":{"exports":["names"],"imports":[{"from":"path","names":["names"]}],"interfaces":["names"],"patterns":["label"],"summary":"one sentence"}}
 
-If no issues: {"issues":[],"metadata":{"exports":[],"imports":[],"interfaces":[],"patterns":[],"summary":"one sentence"}}
+If no issues: {"issues":[],"metadata":{"exports":[],"imports":[],"interfaces":[],"patterns":[],"summary":"one sentence"}}`
 
-File: %s
-`+"```%s\n%s\n```", language, path, language, content)
+// callLLMForScan sends a file to the LLM for review and returns the raw
+// response, whether it was truncated, and any error.
+func callLLMForScan(client *api.Client, model, path, language, content string, tokenEstimate int, prog Progress) (string, bool, error) {
+	// Add line numbers so the model can reference exact lines
+	numberedContent := addLineNumbers(content)
+
+	// Dynamic per-file content — only this part changes between files.
+	userMsg := fmt.Sprintf("Review this %s file.\n\nFile: %s\n```%s\n%s\n```",
+		language, path, language, numberedContent)
 
 	// Request a context window large enough for input + output + safety margin.
 	// Ollama defaults to a small context (often 2048–4096) unless told otherwise.
@@ -270,10 +401,13 @@ File: %s
 
 	stream := true
 	req := &api.ChatRequest{
-		Model:    model,
-		Messages: []api.Message{{Role: "user", Content: prompt}},
-		Stream:   &stream,
-		Format:   json.RawMessage(`"json"`),
+		Model: model,
+		Messages: []api.Message{
+			{Role: "system", Content: scanSystemPrompt},
+			{Role: "user", Content: userMsg},
+		},
+		Stream: &stream,
+		Format: json.RawMessage(`"json"`),
 		Options: map[string]any{
 			"temperature": 0.3,
 			"num_predict": numPredict,
@@ -316,19 +450,23 @@ File: %s
 	return "", false, fmt.Errorf("after 3 retries: %w", lastErr)
 }
 
+// scanConciseSystemPrompt is a stripped-down system prompt for the retry path.
+const scanConciseSystemPrompt = `You are a senior code reviewer. Report ONLY critical and high severity bugs or security issues. Skip everything else.
+
+Keep your response as SHORT as possible. One sentence per field. Limit to at most 5 issues.
+Use confidence 0.9+ only for bugs you can see directly. Use 0.7-0.8 for likely issues. Do not report anything below 0.5 confidence.
+
+Return ONLY this JSON:
+{"issues":[{"category":"bug|security|perf","severity":"critical|high","confidence":0.0-1.0,"title":"short","description":"brief","line_start":null,"line_end":null,"suggestion":"brief"}],"metadata":{"exports":[],"imports":[],"interfaces":[],"patterns":[],"summary":"one sentence"}}`
+
 // callLLMForScanConcise is a retry variant that asks the LLM to report only
 // critical/high issues and uses a larger output budget. Called when the first
 // attempt was truncated and JSON repair failed.
 func callLLMForScanConcise(client *api.Client, model, path, language, content string, tokenEstimate int, prog Progress) (string, bool, error) {
-	prompt := fmt.Sprintf(`Review this %s file. Report ONLY critical and high severity bugs or security issues. Skip everything else.
+	numberedContent := addLineNumbers(content)
 
-CRITICAL: Keep your response as SHORT as possible. One sentence per field. Limit to at most 5 issues.
-
-Return ONLY this JSON:
-{"issues":[{"category":"bug|security|perf","severity":"critical|high","confidence":0.0-1.0,"title":"short","description":"brief","line_start":null,"line_end":null,"suggestion":"brief"}],"metadata":{"exports":[],"imports":[],"interfaces":[],"patterns":[],"summary":"one sentence"}}
-
-File: %s
-`+"```%s\n%s\n```", language, path, language, content)
+	userMsg := fmt.Sprintf("Review this %s file.\n\nFile: %s\n```%s\n%s\n```",
+		language, path, language, numberedContent)
 
 	numPredict := scanNumPredictMax
 	numCtx := tokenEstimate + numPredict + 1024
@@ -338,10 +476,13 @@ File: %s
 
 	stream := true
 	req := &api.ChatRequest{
-		Model:    model,
-		Messages: []api.Message{{Role: "user", Content: prompt}},
-		Stream:   &stream,
-		Format:   json.RawMessage(`"json"`),
+		Model: model,
+		Messages: []api.Message{
+			{Role: "system", Content: scanConciseSystemPrompt},
+			{Role: "user", Content: userMsg},
+		},
+		Stream: &stream,
+		Format: json.RawMessage(`"json"`),
 		Options: map[string]any{
 			"temperature": 0.2,
 			"num_predict": numPredict,
@@ -771,6 +912,69 @@ func repairTruncatedJSON(s string) string {
 	}
 
 	return trimmed + closing.String()
+}
+
+// filterFindings removes low-signal findings that are likely false positives.
+// It drops findings that:
+//   - have no line reference (the model is probably guessing)
+//   - contain excessive hedging language suggesting uncertainty
+//   - are severity high/critical but describe stylistic or theoretical concerns
+func filterFindings(issues []ScanIssue) []ScanIssue {
+	kept := make([]ScanIssue, 0, len(issues))
+	for _, issue := range issues {
+		if !keepFinding(issue) {
+			continue
+		}
+		kept = append(kept, issue)
+	}
+	return kept
+}
+
+// hedgeWords are phrases that signal the model is unsure — findings with
+// multiple hedges and no line number are almost always false positives.
+var hedgeWords = []string{
+	"potential", "potentially", "might", "could lead to",
+	"if the", "if this", "although", "theoretically",
+	"worth noting", "might be", "could be", "may be",
+	"not guaranteed", "depending on", "in theory",
+}
+
+func keepFinding(issue ScanIssue) bool {
+	desc := strings.ToLower(issue.Description + " " + issue.Title)
+
+	// Count hedging phrases
+	hedges := 0
+	for _, h := range hedgeWords {
+		if strings.Contains(desc, h) {
+			hedges++
+		}
+	}
+
+	hasLine := issue.LineStart != nil
+
+	// No line number + any hedging = drop (model is speculating)
+	if !hasLine && hedges > 0 {
+		return false
+	}
+
+	// 2+ hedges even with a line number = drop (model is very unsure)
+	if hedges >= 2 {
+		return false
+	}
+
+	return true
+}
+
+// addLineNumbers prefixes each line with its 1-based line number.
+// This helps the LLM reference exact lines in its findings.
+func addLineNumbers(content string) string {
+	lines := strings.Split(content, "\n")
+	var b strings.Builder
+	b.Grow(len(content) + len(lines)*6) // rough pre-allocation
+	for i, line := range lines {
+		fmt.Fprintf(&b, "%d: %s\n", i+1, line)
+	}
+	return b.String()
 }
 
 func fixNewlinesInStrings(s string) string {

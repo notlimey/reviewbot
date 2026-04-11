@@ -342,10 +342,11 @@ func startTUI(db *sql.DB, projectRoot, modelName, dbPath, reportPath string, del
 	m := newModel(db, projectRoot, modelName, dbPath, reportPath, delay, maxTools, verbose)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
-	// Wire up the program reference for tuiProgress
+	// Send the program reference in a goroutine — p.Send blocks on an
+	// unbuffered channel until p.Run starts reading, so this cannot be
+	// synchronous. No sleep needed: the goroutine simply blocks until
+	// Run is ready, then delivers the message as the first event.
 	go func() {
-		// Small delay to let the program start
-		time.Sleep(50 * time.Millisecond)
 		p.Send(programRefMsg{program: p})
 	}()
 

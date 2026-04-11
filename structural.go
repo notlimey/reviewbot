@@ -15,7 +15,18 @@ import (
 const (
 	structuralTimeout    = 5 * time.Minute
 	structuralNumPredict = 8192
+
+	// maxClusterContextChars caps the user message for structural review.
+	// Keeps input well within the 32K context window after accounting for
+	// the system prompt, tool definitions, and output budget.
+	maxClusterContextChars = 20000
 )
+
+// fileInfo pairs a file ID with its relative path for cluster grouping.
+type fileInfo struct {
+	id   int64
+	path string
+}
 
 func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay int, verbose bool, prog Progress) error {
 	absRoot, err := filepath.Abs(projectRoot)
@@ -40,14 +51,11 @@ func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay in
 	}
 	defer rows.Close()
 
-	type fileInfo struct {
-		id   int64
-		path string
-	}
 	clusters := make(map[string][]fileInfo)
 	for rows.Next() {
 		var fi fileInfo
 		if err := rows.Scan(&fi.id, &fi.path); err != nil {
+			prog.Warn(fmt.Sprintf("scan file row: %v", err))
 			continue
 		}
 		dir := filepath.Dir(fi.path)
@@ -83,39 +91,13 @@ func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay in
 
 		prog.StructuralClusterStart(reviewed, clusterCount, dir, len(files))
 
-		// Build cluster context
-		var contextBuilder strings.Builder
-		contextBuilder.WriteString(fmt.Sprintf("Cluster: %s\n\nFiles in this cluster:\n", dir))
-
-		var fileIDs []int64
-		for _, f := range files {
-			fileIDs = append(fileIDs, f.id)
-
-			// Get summary
-			var summary sql.NullString
-			db.QueryRow("SELECT summary FROM metadata WHERE file_id = ?", f.id).Scan(&summary)
-
-			contextBuilder.WriteString(fmt.Sprintf("\n--- %s ---\n", f.path))
-			if summary.Valid {
-				contextBuilder.WriteString(fmt.Sprintf("Summary: %s\n", summary.String))
-			}
-
-			// Get existing findings for this file
-			findingRows, err := db.Query(
-				"SELECT severity, category, title FROM findings WHERE file_id = ?", f.id,
-			)
-			if err == nil {
-				for findingRows.Next() {
-					var sev, cat, title string
-					findingRows.Scan(&sev, &cat, &title)
-					contextBuilder.WriteString(fmt.Sprintf("  Finding: [%s/%s] %s\n", sev, cat, title))
-				}
-				findingRows.Close()
-			}
-		}
+		// Build cluster context with priority-based compression.
+		// Critical/high findings are always included; medium/low are trimmed
+		// if the context exceeds the budget.
+		fileIDs, clusterCtx := buildClusterContext(db, dir, files, prog)
 
 		// Run structural review with tool calling
-		issues, err := structuralReview(client, registry, model, contextBuilder.String(), maxTools, verbose, prog)
+		issues, err := structuralReview(client, registry, model, clusterCtx, maxTools, verbose, prog)
 		if err != nil {
 			prog.ScanFileError(reviewed, clusterCount, dir, fmt.Sprintf("error: %v", err))
 			continue
@@ -143,6 +125,124 @@ func runStructural(db *sql.DB, projectRoot, model string, maxTools int, delay in
 
 	prog.StructuralComplete(reviewed)
 	return nil
+}
+
+// clusterFinding is a temporary struct for priority sorting.
+type clusterFinding struct {
+	sev, cat, title string
+	priority        int // 0 = critical, 1 = high, 2 = medium, 3 = low
+}
+
+func findingPriority(sev string) int {
+	switch sev {
+	case "critical":
+		return 0
+	case "high":
+		return 1
+	case "medium":
+		return 2
+	default:
+		return 3
+	}
+}
+
+// buildClusterContext assembles the user message for a structural review,
+// applying priority-based compression when the context exceeds the budget.
+func buildClusterContext(db *sql.DB, dir string, files []fileInfo, prog Progress) ([]int64, string) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Cluster: %s\n\nFiles in this cluster:\n", dir)
+
+	var fileIDs []int64
+
+	// Collect per-file sections: header + summary (always kept) and findings (prioritised)
+	type fileSection struct {
+		header   string           // always included
+		findings []clusterFinding // sorted by priority
+	}
+	var sections []fileSection
+
+	for _, f := range files {
+		fileIDs = append(fileIDs, f.id)
+
+		var sec fileSection
+
+		// Header + summary (priority 0 — always kept)
+		var hdr strings.Builder
+		fmt.Fprintf(&hdr, "\n--- %s ---\n", f.path)
+
+		var summary sql.NullString
+		db.QueryRow("SELECT summary FROM metadata WHERE file_id = ?", f.id).Scan(&summary)
+		if summary.Valid {
+			fmt.Fprintf(&hdr, "Summary: %s\n", summary.String)
+		}
+		sec.header = hdr.String()
+
+		// Findings with priority
+		findingRows, err := db.Query(
+			"SELECT severity, category, title FROM findings WHERE file_id = ?", f.id,
+		)
+		if err == nil {
+			for findingRows.Next() {
+				var sev, cat, title string
+				if err := findingRows.Scan(&sev, &cat, &title); err != nil {
+					prog.Warn(fmt.Sprintf("scan finding row: %v", err))
+					continue
+				}
+				sec.findings = append(sec.findings, clusterFinding{
+					sev: sev, cat: cat, title: title,
+					priority: findingPriority(sev),
+				})
+			}
+			findingRows.Close()
+		}
+
+		// Sort findings: critical first, low last
+		sort.Slice(sec.findings, func(i, j int) bool {
+			return sec.findings[i].priority < sec.findings[j].priority
+		})
+
+		sections = append(sections, sec)
+	}
+
+	// Phase 1: write all headers + all findings
+	for _, sec := range sections {
+		b.WriteString(sec.header)
+		for _, f := range sec.findings {
+			fmt.Fprintf(&b, "  Finding: [%s/%s] %s\n", f.sev, f.cat, f.title)
+		}
+	}
+
+	// Phase 2: if over budget, rebuild with only critical/high findings
+	if b.Len() > maxClusterContextChars {
+		b.Reset()
+		fmt.Fprintf(&b, "Cluster: %s\n\nFiles in this cluster:\n", dir)
+		trimmed := 0
+		for _, sec := range sections {
+			b.WriteString(sec.header)
+			for _, f := range sec.findings {
+				if f.priority <= 1 { // critical or high
+					fmt.Fprintf(&b, "  Finding: [%s/%s] %s\n", f.sev, f.cat, f.title)
+				} else {
+					trimmed++
+				}
+			}
+		}
+		if trimmed > 0 {
+			fmt.Fprintf(&b, "\n[%d medium/low findings omitted for context budget]\n", trimmed)
+		}
+	}
+
+	// Phase 3: if still over budget, drop all findings — just summaries
+	if b.Len() > maxClusterContextChars {
+		b.Reset()
+		fmt.Fprintf(&b, "Cluster: %s\n\nFiles in this cluster:\n", dir)
+		for _, sec := range sections {
+			b.WriteString(sec.header)
+		}
+		b.WriteString("\n[All per-file findings omitted for context budget — use tools to explore]\n")
+	}
+
+	return fileIDs, b.String()
 }
 
 func structuralReview(client *api.Client, registry *ToolRegistry, model, clusterContext string, maxTools int, verbose bool, prog Progress) ([]StructuralIssue, error) {

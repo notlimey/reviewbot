@@ -10,4 +10,4 @@ reviewbot              # interactive TUI
 reviewbot all ./src    # CLI mode
 ```
 
-Requires [Ollama](https://ollama.ai) running locally with `gemma4:26b` pulled.
+Requires [Ollama](https://ollama.ai) running locally with `gemma4:e4b` pulled.

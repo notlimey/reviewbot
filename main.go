@@ -15,7 +15,7 @@ import (
 func main() {
 	// Global flags (parsed before command dispatch)
 	fs := flag.NewFlagSet("reviewbot", flag.ExitOnError)
-	modelFlag := fs.String("model", "gemma4:26b", "Ollama model name")
+	modelFlag := fs.String("model", "gemma4:e4b", "Ollama model name")
 	dbFlag := fs.String("db", "review.db", "SQLite database path")
 	delayFlag := fs.Int("delay", 2, "Seconds between LLM calls for thermal management")
 	reportFlag := fs.String("report", "review_report.md", "Output report path")
@@ -372,7 +372,7 @@ Commands:
   reset         Drop all tables and start fresh
 
 Flags:
-  -model        Ollama model name (default: "gemma4:26b")
+  -model        Ollama model name (default: "gemma4:e4b")
   -db           SQLite database path (default: "review.db")
   -delay        Seconds between LLM calls (default: 2)
   -report       Output report path (default: "review_report.md")
