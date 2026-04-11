@@ -19,6 +19,32 @@ const (
 	scanNumPredictMax = 16384 // output limit for large files
 )
 
+// Fixed context tiers. Using a small set of fixed values (instead of per-file
+// dynamic sizing) lets Ollama reuse the KV cache across files in the same tier.
+// This dramatically speeds up inference because the system prompt prefix only
+// needs to be computed once per tier.
+const (
+	ctxTierSmall  = 8192  // files up to ~3K tokens
+	ctxTierMedium = 16384 // files up to ~7K tokens
+	ctxTierLarge  = 32768 // files up to ~15K tokens
+	ctxTierXLarge = 49152 // files up to ~30K tokens
+)
+
+// scanContextTier returns a fixed num_ctx tier for the given token estimate.
+func scanContextTier(tokenEstimate, numPredict int) int {
+	needed := tokenEstimate + numPredict + 1024
+	switch {
+	case needed <= ctxTierSmall:
+		return ctxTierSmall
+	case needed <= ctxTierMedium:
+		return ctxTierMedium
+	case needed <= ctxTierLarge:
+		return ctxTierLarge
+	default:
+		return ctxTierXLarge
+	}
+}
+
 // scanNumPredict scales the output token budget based on estimated input size.
 // Larger files produce more findings & metadata and need more room to respond.
 func scanNumPredict(tokenEstimate int) int {
@@ -391,13 +417,8 @@ func callLLMForScan(client *api.Client, model, path, language, content string, t
 	userMsg := fmt.Sprintf("Review this %s file.\n\nFile: %s\n```%s\n%s\n```",
 		language, path, language, numberedContent)
 
-	// Request a context window large enough for input + output + safety margin.
-	// Ollama defaults to a small context (often 2048–4096) unless told otherwise.
 	numPredict := scanNumPredict(tokenEstimate)
-	numCtx := tokenEstimate + numPredict + 1024 // input + output + overhead
-	if numCtx < 8192 {
-		numCtx = 8192
-	}
+	numCtx := scanContextTier(tokenEstimate, numPredict)
 
 	stream := true
 	req := &api.ChatRequest{
@@ -469,10 +490,7 @@ func callLLMForScanConcise(client *api.Client, model, path, language, content st
 		language, path, language, numberedContent)
 
 	numPredict := scanNumPredictMax
-	numCtx := tokenEstimate + numPredict + 1024
-	if numCtx < 8192 {
-		numCtx = 8192
-	}
+	numCtx := scanContextTier(tokenEstimate, numPredict)
 
 	stream := true
 	req := &api.ChatRequest{
