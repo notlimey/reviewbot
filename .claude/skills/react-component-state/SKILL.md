@@ -1,6 +1,9 @@
 ---
 name: react-component-state
 description: "Where React component state belongs — local vs lifted vs global vs URL vs server; placement of React Query/Zustand/XState. Not for state-mgmt patterns (→ state-management) or component logic (→ component-logic)."
+paths:
+  - "**/*.tsx"
+  - "**/*.jsx"
 ---
 
 # React component state placement

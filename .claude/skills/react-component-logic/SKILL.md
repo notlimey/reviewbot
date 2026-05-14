@@ -1,6 +1,9 @@
 ---
 name: react-component-logic
 description: "React component internal logic — control flow, hooks usage, memoization, early returns, comments. Not for component API (→ component-api), state placement (→ component-state), or styling (→ component-styling)."
+paths:
+  - "**/*.tsx"
+  - "**/*.jsx"
 ---
 
 # React component logic

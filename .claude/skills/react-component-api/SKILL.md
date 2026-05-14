@@ -1,6 +1,9 @@
 ---
 name: react-component-api
 description: "React component API — props, type definitions, file structure, naming, export shape. Not for control flow/hooks (→ component-logic), state placement (→ component-state), or styling (→ component-styling)."
+paths:
+  - "**/*.tsx"
+  - "**/*.jsx"
 ---
 
 # React component API

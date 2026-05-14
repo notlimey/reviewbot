@@ -1,6 +1,10 @@
 ---
 name: kubernetes-rbac
 description: "kubebuilder RBAC markers and ClusterRole/Role manifests for operators — ServiceAccount permissions, generated config/rbac/role.yaml. Not for application-level RBAC."
+paths:
+  - "**/rbac/**"
+  - "**/role*.yaml"
+  - "**/*controller*.go"
 ---
 
 # Operator RBAC

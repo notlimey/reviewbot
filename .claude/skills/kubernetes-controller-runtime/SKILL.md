@@ -1,6 +1,10 @@
 ---
 name: kubernetes-controller-runtime
 description: "controller-runtime operators — Reconcile loop, ctrl.Result, requeue, Status().Update, manager setup, signal handling. Not for CRD type design (→ crd-design) or RBAC markers (→ rbac)."
+paths:
+  - "**/*controller*.go"
+  - "**/controllers/**/*.go"
+  - "**/internal/controller/**/*.go"
 ---
 
 # Controller-Runtime Patterns

@@ -1,6 +1,10 @@
 ---
 name: typescript-strictness
 description: "TypeScript strict-mode discipline — tsconfig strict flags (strictNullChecks, noImplicitAny), narrowing patterns, avoiding any/non-null assertions/type assertions. Not for general TS questions."
+paths:
+  - "**/*.ts"
+  - "**/*.tsx"
+  - "**/tsconfig*.json"
 ---
 
 # TypeScript strictness

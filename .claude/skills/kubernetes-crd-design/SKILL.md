@@ -1,6 +1,9 @@
 ---
 name: kubernetes-crd-design
 description: "CustomResourceDefinitions and Go API types — kubebuilder markers, +listType, +listMapKey, Spec/Status shape, validation. Not for reconcile logic (→ controller-runtime) or RBAC (→ rbac)."
+paths:
+  - "**/api/**/*.go"
+  - "**/*_types.go"
 ---
 
 # CRD Design

@@ -1,6 +1,11 @@
 ---
 name: kubernetes-kustomize
 description: "Kustomize bases and overlays — kustomization.yaml, patchesStrategicMerge, remote refs, env-specific manifests. Not for Helm charts or non-Kubernetes config."
+paths:
+  - "**/kustomization.yaml"
+  - "**/kustomization.yml"
+  - "**/overlays/**"
+  - "**/bases/**"
 ---
 
 # Kustomize & Deployment Config

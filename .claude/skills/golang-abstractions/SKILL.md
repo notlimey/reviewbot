@@ -1,6 +1,8 @@
 ---
 name: golang-abstractions
 description: "Go interface design, dependency injection seams, shared helpers, vendor names in API types, leaky abstractions. Not for general Go style (→ code-style) or error/concurrency/testing (→ those skills)."
+paths:
+  - "**/*.go"
 ---
 
 # Abstractions & Architecture

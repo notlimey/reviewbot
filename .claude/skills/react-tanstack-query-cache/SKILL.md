@@ -1,6 +1,9 @@
 ---
 name: react-tanstack-query-cache
 description: "TanStack Query v5 cache config — QueryClient defaultOptions, staleTime/gcTime buckets, refetchInterval polling, AbortSignal cancellation, on-disk persistence. Not for hook-level reads (→ tanstack-query-reads) or mutations (→ tanstack-query-mutations)."
+paths:
+  - "**/*.tsx"
+  - "**/*.ts"
 ---
 
 # TanStack Query — cache configuration

@@ -1,6 +1,9 @@
 ---
 name: react-tanstack-query-reads
 description: "Read-side TanStack Query v5 — useQuery, useSuspenseQuery, useInfiniteQuery, queryOptions, key factories, select, Suspense loading. Not for mutations (→ tanstack-query-mutations) or cache config (→ tanstack-query-cache)."
+paths:
+  - "**/*.tsx"
+  - "**/*.ts"
 ---
 
 # TanStack Query — reads

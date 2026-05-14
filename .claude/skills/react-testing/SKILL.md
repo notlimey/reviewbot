@@ -1,6 +1,12 @@
 ---
 name: react-testing
 description: "React component tests with React Testing Library/Vitest/Jest — render, screen.getByRole, userEvent, MSW handlers, act() warnings, QueryClient in tests. Not for Playwright/Cypress E2E or non-React testing."
+paths:
+  - "**/*.test.tsx"
+  - "**/*.test.ts"
+  - "**/*.spec.tsx"
+  - "**/*.spec.ts"
+  - "**/__tests__/**"
 ---
 
 # React Testing

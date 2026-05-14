@@ -1,6 +1,9 @@
 ---
 name: golang-test-integration
 description: "Go integration tests — //go:build integration tags, FuzzX, golden files with -update, envtest, operator/CRD/reconciler coverage. Not for unit-test style (→ test-style) or test doubles (→ test-doubles)."
+paths:
+  - "**/*_test.go"
+  - "**/testdata/**"
 ---
 
 # Go integration & specialized tests

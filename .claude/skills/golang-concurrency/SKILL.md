@@ -1,6 +1,8 @@
 ---
 name: golang-concurrency
 description: "Go concurrency — goroutines, channels, sync primitives, context, cancellation, races, worker pools, fan-out/fan-in. Not for general Go style (→ code-style) or non-Go languages."
+paths:
+  - "**/*.go"
 ---
 
 # Go Concurrency

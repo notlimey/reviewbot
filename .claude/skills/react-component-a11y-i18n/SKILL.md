@@ -1,6 +1,9 @@
 ---
 name: react-component-a11y-i18n
 description: "React component accessibility and internationalization — semantic HTML, ARIA, keyboard support, WCAG, translation hooks. Not for styling, logic, structure, or state."
+paths:
+  - "**/*.tsx"
+  - "**/*.jsx"
 ---
 
 # React component accessibility & internationalization

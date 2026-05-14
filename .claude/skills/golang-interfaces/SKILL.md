@@ -1,6 +1,8 @@
 ---
 name: golang-interfaces
 description: "Go interfaces — compile-time `var _ I = (*T)(nil)` assertions, doc-on-interface contracts, nil-interface gotcha, pointer/value receivers, accept-interfaces-return-structs. Not for architecture/DI (→ abstractions)."
+paths:
+  - "**/*.go"
 ---
 
 # Go Interfaces

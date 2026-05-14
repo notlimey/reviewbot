@@ -1,6 +1,9 @@
 ---
 name: react-tanstack-query-mutations
 description: "Write-side TanStack Query v5 — useMutation, optimistic updates with onMutate/onError rollback, setQueryData, invalidateQueries. Not for reads (→ tanstack-query-reads) or QueryClient defaults (→ tanstack-query-cache)."
+paths:
+  - "**/*.tsx"
+  - "**/*.ts"
 ---
 
 # TanStack Query — mutations

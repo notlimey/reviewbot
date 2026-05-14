@@ -1,6 +1,8 @@
 ---
 name: golang-test-doubles
 description: "Go test doubles — hand-written fakes vs gomock/mockery, httptest servers, clock injection, time.Now in tests. Not for general test discipline (→ test-style) or integration tests (→ test-integration)."
+paths:
+  - "**/*_test.go"
 ---
 
 # Go test doubles

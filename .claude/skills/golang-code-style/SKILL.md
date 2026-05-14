@@ -1,6 +1,8 @@
 ---
 name: golang-code-style
 description: "General Go style — early returns, structured logging, named returns, magic strings, exported API surface, URL building, SQL injection. Not for error handling, concurrency, testing, or non-Go languages."
+paths:
+  - "**/*.go"
 ---
 
 # Go Code Style

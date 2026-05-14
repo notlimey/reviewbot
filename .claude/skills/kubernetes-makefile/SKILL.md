@@ -1,6 +1,9 @@
 ---
 name: kubernetes-makefile
 description: "Makefiles for Kubernetes operator dev — deploy/undeploy/test targets, kind clusters, kubectl context safety, golangci-lint version pinning. Not for general Make or non-K8s shell scripts."
+paths:
+  - "**/Makefile"
+  - "**/*.mk"
 ---
 
 # Makefile & Local Development

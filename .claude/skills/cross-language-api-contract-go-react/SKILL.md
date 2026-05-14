@@ -1,6 +1,10 @@
 ---
 name: cross-language-api-contract-go-react
 description: "Go↔React wire contract — JSON shapes, error envelopes, time/money encoding, nullability, pagination, OpenAPI/protobuf/tygo codegen. Not for Go-only API design or React data fetching (→ tanstack-query-reads)."
+paths:
+  - "**/*.go"
+  - "**/*.ts"
+  - "**/*.tsx"
 ---
 
 # Go ↔ React API Contracts

@@ -1,6 +1,10 @@
 ---
 name: kubernetes-cilium-network-policies
 description: "Cilium NetworkPolicies (CNP, CCNP) — endpointSelector, egress rules, DNS egress, serviceAccount selectors. Not for stock Kubernetes NetworkPolicies or unrelated networking."
+paths:
+  - "**/*policy*.yaml"
+  - "**/*policy*.yml"
+  - "**/network-polic*/**"
 ---
 
 # Cilium Network Policies

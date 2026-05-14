@@ -1,6 +1,8 @@
 ---
 name: golang-error-handling
 description: "Go error handling — fmt.Errorf wrapping, sentinel errors, errors.Is/As, multi-error, propagation across layers. Not for general Go style (→ code-style) or non-Go languages."
+paths:
+  - "**/*.go"
 ---
 
 # Go Error Handling

@@ -1,6 +1,10 @@
 ---
 name: kubernetes-grafana-dashboards
 description: "Grafana dashboard JSON and ConfigMaps — datasource UIDs, panel definitions, dashboard provisioning. Not for Prometheus rules/alerts or non-Grafana visualization."
+paths:
+  - "**/dashboards/**"
+  - "**/*dashboard*.json"
+  - "**/*dashboard*.yaml"
 ---
 
 # Grafana Dashboards

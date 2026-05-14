@@ -1,6 +1,9 @@
 ---
 name: golang-test-style
 description: "Go unit-test discipline — table-driven subtests, t.Parallel, t.Helper, t.Cleanup, require.Equal, cmp.Diff, black-box tests, testdata, naming. Not for test doubles (→ test-doubles) or integration tests (→ test-integration)."
+paths:
+  - "**/*_test.go"
+  - "**/testdata/**"
 ---
 
 # Go test style

@@ -1,6 +1,10 @@
 ---
 name: react-state-management
 description: "React state-management patterns and library choice — useState, useReducer, context API, Redux, Zustand, nuqs, XState. Not for state placement (→ component-state) or TanStack Query (→ tanstack-query-reads)."
+paths:
+  - "**/*.tsx"
+  - "**/*.ts"
+  - "**/*.jsx"
 ---
 
 # React state management

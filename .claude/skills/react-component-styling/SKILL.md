@@ -1,6 +1,9 @@
 ---
 name: react-component-styling
 description: "React component styling and folder layout — Tailwind, vertical slices, file organization, UI primitives. Not for component API (→ component-api), logic (→ component-logic), state, or a11y."
+paths:
+  - "**/*.tsx"
+  - "**/*.jsx"
 ---
 
 # React component styling

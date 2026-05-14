@@ -1,6 +1,12 @@
 ---
 name: react-nextjs
 description: "Next.js v13+ App Router — server components/actions, route handlers, middleware, next/image, next/link, generateMetadata, loading.tsx, error.tsx, revalidate, 'use server', app/ files. Not for plain React or Pages Router."
+paths:
+  - "**/app/**/*.tsx"
+  - "**/app/**/*.ts"
+  - "**/next.config.*"
+  - "**/middleware.ts"
+  - "**/middleware.tsx"
 ---
 
 # Next.js (App Router)
